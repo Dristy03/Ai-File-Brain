@@ -1,0 +1,49 @@
+# Default settings for AI File Brain.
+# Override any value via environment variable: AFB_<UPPERCASE_FIELD>=...
+# Example: AFB_WATCH_FOLDER="D:/notes"
+
+watch_folder = "C:/Users/ASUS/Documents/AIFileBrainTest"
+ollama_url = "http://127.0.0.1:11434"
+chroma_path = "./chroma-data"
+embedding_model = "nomic-embed-text"
+chat_model = "llama3.2"
+chunk_size = 2000
+chunk_overlap = 400
+top_k = 5
+
+# OCR — image files and scanned-PDF fallback.
+ocr_enabled = true
+ocr_languages = ["en"]
+pdf_ocr_min_native_chars = 50      # below this total, switch to per-page OCR fallback
+pdf_ocr_per_page_min_chars = 10    # below this on a page, OCR that page
+pdf_ocr_render_dpi = 220
+
+# Hard upper bound on per-file size before indexing. Skips runaway lockfiles,
+# generated bundles, etc. 10 MiB by default.
+max_file_size_bytes = 10485760
+
+# Smart exclusions: any path containing one of these directory names is
+# skipped (case-insensitive). Edit this list in user-settings.toml to add
+# project-specific noise without touching defaults.
+excluded_dir_names = [
+    "AppData",
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".idea",
+    ".vscode",
+    "dist",
+    "build",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+    "site-packages",
+    "Recycle.Bin",
+    "$RECYCLE.BIN",
+]
+
+excluded_extensions = [".lock", ".pyc", ".pyo", ".log", ".tmp", ".bak", ".ps1"]
