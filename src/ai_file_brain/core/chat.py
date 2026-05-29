@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 
@@ -146,28 +147,39 @@ class ChatService:
             yield StatusChunk(message="Embedding your question…")
             embedding = await self._embedder.embed(question)
             yield StatusChunk(message="Searching your files…")
-            sem_hits = await self._vector_repo.query(
-                embedding,
-                self._settings.top_k,
-                modified_at_range=(window.start, window.end) if window else None,
-            )
             keywords = _filename_keywords(question)
-            name_hits = (
-                await self._vector_repo.query_by_filename_substrings(
+            modified_range = (window.start, window.end) if window else None
+
+            # The three retrieval passes are independent once we have the
+            # embedding, so fire them concurrently — total latency becomes the
+            # slowest single call instead of the sum. Substring matching scans
+            # the whole collection, so overlapping it with the two vector
+            # queries is the biggest win.
+            async def _name_pass() -> list[QueryHit]:
+                if not keywords:
+                    return []
+                return await self._vector_repo.query_by_filename_substrings(
                     keywords, n=self._settings.top_k
                 )
-                if keywords
-                else []
-            )
-            # Third signal: semantic match over filename-only stubs (unsupported
-            # files whose contents aren't indexed). Bridges a conceptual question
-            # to a file whose *name* is related — e.g. "office timings" ->
-            # "attendance.xlsx" — which neither content search (excludes stubs)
-            # nor literal substring matching can reach.
-            fname_sem_hits = await self._vector_repo.query_filename_only(
-                embedding,
-                self._settings.top_k,
-                modified_at_range=(window.start, window.end) if window else None,
+
+            sem_hits, name_hits, fname_sem_hits = await asyncio.gather(
+                self._vector_repo.query(
+                    embedding,
+                    self._settings.top_k,
+                    modified_at_range=modified_range,
+                ),
+                _name_pass(),
+                # Third signal: semantic match over filename-only stubs
+                # (unsupported files whose contents aren't indexed). Bridges a
+                # conceptual question to a file whose *name* is related —
+                # e.g. "office timings" -> "attendance.xlsx" — which neither
+                # content search (excludes stubs) nor literal substring
+                # matching can reach.
+                self._vector_repo.query_filename_only(
+                    embedding,
+                    self._settings.top_k,
+                    modified_at_range=modified_range,
+                ),
             )
             # Priority order: literal name match (high precision), then content
             # semantic, then filename semantic. Dedupe by path, cap at top_k so
