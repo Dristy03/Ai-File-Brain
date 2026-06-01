@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import AsyncIterator
 
 from ollama import AsyncClient
@@ -18,7 +19,7 @@ from ai_file_brain.core.models import (
 )
 import re
 
-from ai_file_brain.core.storage import VectorRepository
+from ai_file_brain.core.storage import VectorRepository, _under_watch_folder
 from ai_file_brain.core.time_intent import (
     RecencyIntent,
     TimeWindow,
@@ -117,9 +118,50 @@ class ChatService:
         # Replaying the full prior user message (with file chunks) lets follow-up
         # questions like "tell me about <file from previous answer>" work.
         self._history: list[dict[str, str]] = []
+        # Background fire-and-forget tasks that purge stale index entries spotted
+        # at query time. Kept referenced so they aren't garbage-collected mid-run.
+        self._purge_tasks: set[asyncio.Task] = set()
 
     def clear_history(self) -> None:
         self._history.clear()
+
+    def _filter_existing(self, hits: list[QueryHit]) -> list[QueryHit]:
+        """Drop hits whose backing file no longer exists under the watch folder.
+
+        A file deleted from the watch folder while the app wasn't running (or via
+        a filesystem event the watcher missed) can still have chunks in the
+        index. We never want those in an answer, so this is the last line of
+        defense at retrieval time — and we opportunistically purge the stale
+        chunks so future queries don't pay for them.
+
+        Files *outside* the current watch folder are left untouched: they belong
+        to a previously-watched folder that's intentionally retained (see storage
+        scoping), so their on-disk presence isn't ours to judge.
+        """
+        folder = self._settings.watch_folder
+        kept: list[QueryHit] = []
+        for hit in hits:
+            path = hit.file_path
+            if path and _under_watch_folder(path, folder) and not os.path.exists(path):
+                self._purge_stale(path)
+                continue
+            kept.append(hit)
+        return kept
+
+    def _purge_stale(self, file_path: str) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._safe_delete(file_path))
+        self._purge_tasks.add(task)
+        task.add_done_callback(self._purge_tasks.discard)
+
+    async def _safe_delete(self, file_path: str) -> None:
+        try:
+            await self._vector_repo.delete_by_path(file_path)
+        except Exception as ex:
+            logger.debug("Opportunistic purge failed for %s: %s", file_path, ex)
 
     async def ask(self, question: str) -> ChatResult:
         answer_parts: list[str] = []
@@ -187,6 +229,11 @@ class ChatService:
             hits = _merge_unique(
                 [name_hits, sem_hits, fname_sem_hits], self._settings.top_k
             )
+
+        # Final guard: never surface a file that's been deleted from the watch
+        # folder, even if a filesystem event was missed or its index chunks
+        # weren't purged. Also opportunistically cleans those chunks up.
+        hits = self._filter_existing(hits)
 
         if not hits:
             if recency is not None:

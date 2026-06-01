@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from watchdog.events import (
+    DirDeletedEvent,
+    DirMovedEvent,
     FileCreatedEvent,
     FileDeletedEvent,
     FileModifiedEvent,
@@ -24,7 +26,7 @@ from ai_file_brain.core.embedding import EmbeddingService
 from ai_file_brain.core.exclusions import is_excluded
 from ai_file_brain.core.extraction import get_extractor, is_supported
 from ai_file_brain.core.models import FileChunk
-from ai_file_brain.core.storage import VectorRepository
+from ai_file_brain.core.storage import VectorRepository, _under_watch_folder
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +248,10 @@ class FileWatcherService:
         # Run the initial scan in the background so a large watch root (e.g. D:\)
         # doesn't block the UI from coming up. Tracked in _tasks so stop() cancels it.
         self._schedule_task(self._initial_scan())
+        # Files can disappear while the app is closed — watchdog only sees events
+        # while running. Reconcile on startup so anything deleted offline is
+        # dropped from the index instead of lingering in retrieval forever.
+        self._schedule_task(self._reconcile_index())
 
     async def stop(self) -> None:
         if not self._running:
@@ -275,12 +281,22 @@ class FileWatcherService:
             # a no-op when there's nothing to remove.
             self._schedule_task(self._handle_delete(src))
             return
+        if kind == "dir_deleted":
+            # A whole directory was removed. Watchdog reports this as one event,
+            # not one-per-contained-file, so purge every indexed file under it.
+            self._schedule_task(self._handle_dir_delete(src))
+            return
         if kind == "moved":
             if dst and self._should_track(dst):
                 self._schedule_task(self._handle_rename(src, dst))
             else:
                 # Source moved out of a tracked location → treat as delete.
                 self._schedule_task(self._handle_delete(src))
+            return
+        if kind == "dir_moved":
+            # Directory relocated: drop the old subtree's chunks, then re-index
+            # the new location if it's still inside the watch folder.
+            self._schedule_task(self._handle_dir_move(src, dst))
             return
         # created / modified
         if self._should_track(src):
@@ -344,6 +360,33 @@ class FileWatcherService:
             logger.warning("Delete-on-rename failed for %s: %s", old_path, ex)
         await self._index(new_path)
 
+    async def _handle_dir_delete(self, dir_path: str) -> None:
+        try:
+            await self._repo.delete_under_dir(dir_path)
+            self._notify(IndexingProgress(dir_path, "deleted"))
+        except Exception as ex:
+            logger.warning("Delete-subtree-from-index failed for %s: %s", dir_path, ex)
+
+    async def _handle_dir_move(self, old_dir: str, new_dir: str | None) -> None:
+        try:
+            await self._repo.delete_under_dir(old_dir)
+        except Exception as ex:
+            logger.warning("Delete-subtree-on-move failed for %s: %s", old_dir, ex)
+        # Moved within the watch folder → re-index the files at their new home.
+        # Moved outside → nothing to re-index; the purge above is the whole job.
+        if new_dir and _under_watch_folder(new_dir, self._settings.watch_folder):
+            await self._scan_and_index(new_dir)
+
+    async def _scan_and_index(self, root: str) -> None:
+        try:
+            paths = await asyncio.to_thread(self._list_files, root)
+        except OSError as ex:
+            logger.warning("Scan of %s failed: %s", root, ex)
+            return
+        for file_path in paths:
+            if self._should_track(file_path):
+                self._schedule_task(self._index(file_path))
+
     async def _initial_scan(self) -> None:
         folder = Path(self._settings.watch_folder)
         for path in folder.rglob("*"):
@@ -359,6 +402,40 @@ class FileWatcherService:
                 already = False
             if not already:
                 self._schedule_task(self._index(file_path))
+
+    async def _reconcile_index(self) -> None:
+        """Drop index entries for watched files that no longer exist on disk.
+
+        The watcher only sees deletions that happen while it's running; a file
+        removed while the app was closed would otherwise linger in the index and
+        keep surfacing in retrieval. On startup we list every indexed path under
+        the current watch folder and delete the ones that are gone. Paths from a
+        previously-watched folder are left alone — those are intentionally
+        retained so switching back is instant (see storage scoping).
+        """
+        try:
+            indexed = await self._repo.all_file_paths()
+        except Exception as ex:
+            logger.warning("Index reconcile failed to list paths: %s", ex)
+            return
+        folder = self._settings.watch_folder
+
+        def _missing() -> list[str]:
+            return [
+                p
+                for p in indexed
+                if _under_watch_folder(p, folder) and not os.path.exists(p)
+            ]
+
+        missing = await asyncio.to_thread(_missing)
+        for file_path in missing:
+            logger.info("Reconcile: dropping vanished file from index: %s", file_path)
+            self._schedule_task(self._handle_delete(file_path))
+
+    @staticmethod
+    def _list_files(root: str) -> list[str]:
+        base = Path(root)
+        return [str(p) for p in base.rglob("*") if p.is_file()]
 
     def _notify(self, progress: IndexingProgress) -> None:
         if self._progress is None:
@@ -383,9 +460,13 @@ class _Handler(FileSystemEventHandler):
             self._parent._on_event("modified", event.src_path)
 
     def on_deleted(self, event):
-        if isinstance(event, FileDeletedEvent):
+        if isinstance(event, DirDeletedEvent):
+            self._parent._on_event("dir_deleted", event.src_path)
+        elif isinstance(event, FileDeletedEvent):
             self._parent._on_event("deleted", event.src_path)
 
     def on_moved(self, event):
-        if isinstance(event, FileMovedEvent):
+        if isinstance(event, DirMovedEvent):
+            self._parent._on_event("dir_moved", event.src_path, event.dest_path)
+        elif isinstance(event, FileMovedEvent):
             self._parent._on_event("moved", event.src_path, event.dest_path)

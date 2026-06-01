@@ -11,6 +11,14 @@ chunk_size = 2000
 chunk_overlap = 400
 top_k = 5
 
+# Relevance gate (cosine distance: 0 = identical, 2 = opposite). Chunks farther
+# than the ceiling are dropped before answering, so unrelated files stop showing
+# up as "sources" and a topic with no real match returns a clean "not found".
+# Lower = stricter. Filename-only stubs (.exe, .m4a …) embed just the name's
+# words, so they get a looser ceiling.
+max_match_distance = 0.6
+max_filename_match_distance = 0.85
+
 # OCR — image files and scanned-PDF fallback.
 ocr_enabled = true
 ocr_languages = ["en"]

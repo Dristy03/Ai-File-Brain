@@ -49,6 +49,8 @@ class VectorRepository(Protocol):
         self, chunks: list[FileChunk], embeddings: list[list[float]]
     ) -> None: ...
     async def delete_by_path(self, file_path: str) -> None: ...
+    async def delete_under_dir(self, dir_path: str) -> None: ...
+    async def all_file_paths(self) -> set[str]: ...
     async def query(
         self,
         embedding: list[float],
@@ -140,6 +142,48 @@ class ChromaVectorRepository:
         col = self._require()
         await asyncio.to_thread(col.delete, where={"file_path": file_path})
 
+    async def delete_under_dir(self, dir_path: str) -> None:
+        """Delete every chunk whose file lives under ``dir_path`` (recursive).
+
+        Used when a whole directory is removed from, or moved out of, the watch
+        tree — watchdog reports that as a single directory event, not one event
+        per contained file, so the per-file ``delete_by_path`` never fires for
+        them. Chroma's ``where`` can't do path-prefix matching, so we enumerate
+        distinct paths and delete the matches in one call.
+        """
+        paths = await self.all_file_paths()
+        norm = os.path.normcase(os.path.normpath(dir_path))
+        prefix = norm if norm.endswith(os.sep) else norm + os.sep
+        victims = [
+            p
+            for p in paths
+            if os.path.normcase(os.path.normpath(p)).startswith(prefix)
+        ]
+        if not victims:
+            return
+        col = self._require()
+        await asyncio.to_thread(col.delete, where={"file_path": {"$in": victims}})
+
+    async def all_file_paths(self) -> set[str]:
+        """Every distinct ``file_path`` currently represented in the index.
+
+        Scans all chunk metadata (O(N) in collection size), so callers should
+        treat it as a maintenance operation, not a hot-path query. Used by the
+        watcher's startup reconcile to find indexed files that no longer exist
+        on disk.
+        """
+        col = self._require()
+        result = await asyncio.to_thread(col.get, include=["metadatas"])
+        metas = result.get("metadatas") or []
+        paths: set[str] = set()
+        for meta in metas:
+            if not meta:
+                continue
+            p = meta.get("file_path")
+            if isinstance(p, str) and p:
+                paths.add(p)
+        return paths
+
     async def query(
         self,
         embedding: list[float],
@@ -163,7 +207,15 @@ class ChromaVectorRepository:
         result = await asyncio.to_thread(col.query, **kwargs)
         all_hits = _result_to_hits(result)
         folder = self._settings.watch_folder
-        scoped = [h for h in all_hits if _under_watch_folder(h.file_path, folder)]
+        limit = self._settings.max_match_distance
+        # Drop neighbours that are merely the *closest* but not actually
+        # relevant — without this, every query returns top_k files no matter how
+        # unrelated, so a topic with no real match still lists junk "sources".
+        scoped = [
+            h
+            for h in all_hits
+            if h.distance <= limit and _under_watch_folder(h.file_path, folder)
+        ]
         return scoped[:top_k]
 
     async def query_filename_only(
@@ -199,7 +251,12 @@ class ChromaVectorRepository:
         )
         all_hits = _result_to_hits(result)
         folder = self._settings.watch_folder
-        scoped = [h for h in all_hits if _under_watch_folder(h.file_path, folder)]
+        limit = self._settings.max_filename_match_distance
+        scoped = [
+            h
+            for h in all_hits
+            if h.distance <= limit and _under_watch_folder(h.file_path, folder)
+        ]
         return scoped[:n]
 
     async def most_recent(self, n: int) -> list[QueryHit]:

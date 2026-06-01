@@ -26,6 +26,18 @@ class AiFileBrainSettings(BaseSettings):
     chunk_overlap: int = 400
     top_k: int = 5
 
+    # Cosine-distance ceiling for a chunk to count as relevant (cosine space:
+    # 0 = identical, 2 = opposite). Hits farther than this are dropped before
+    # they reach the answer, so unrelated files stop appearing as "sources" and
+    # a query with no real match returns a clean "not found". Tune lower for
+    # stricter matching, higher to admit weaker matches.
+    max_match_distance: float = 0.6
+    # Filename-only stubs (unsupported types: .exe, .m4a …) embed just the
+    # filename's words, so their distances run higher than full-content chunks
+    # for the same intent. Give them a looser ceiling so a name-based match
+    # ("attendance.xlsx" for "office timings") still survives.
+    max_filename_match_distance: float = 0.85
+
     ocr_enabled: bool = True
     ocr_languages: list[str] = ["en"]
     pdf_ocr_min_native_chars: int = 50
