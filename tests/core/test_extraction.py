@@ -30,8 +30,12 @@ def test_is_supported():
     assert is_supported("m.yaml")
     assert is_supported("n.toml")
     assert is_supported("o.md")
+    assert is_supported("r.pptx")
+    assert is_supported("s.XLSX")
+    assert is_supported("t.ppt")  # legacy binary PowerPoint
+    assert is_supported("u.xls")  # legacy binary Excel
+    assert is_supported("v.DOC")  # legacy binary Word
     assert not is_supported("p.exe")
-    assert not is_supported("q.doc")  # legacy binary format intentionally unsupported
 
 
 def test_unsupported_raises():
@@ -157,6 +161,253 @@ async def test_docx_extractor_handles_corrupt_file(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_docx_extractor_handles_missing_file(tmp_path: Path):
     fake = tmp_path / "ghost.docx"
+    extractor = get_extractor(str(fake))
+    result = await extractor.extract(str(fake))
+    assert result.text == ""
+    assert result.source == "native"
+
+
+# --- pptx ---
+
+
+def _make_pptx(path: Path, title: str, body: str, notes: str = "") -> None:
+    from pptx import Presentation
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[1])  # title + content
+    slide.shapes.title.text = title
+    slide.placeholders[1].text = body
+    if notes:
+        slide.notes_slide.notes_text_frame.text = notes
+    prs.save(str(path))
+
+
+@pytest.mark.asyncio
+async def test_pptx_extractor_reads_slides_and_notes(tmp_path: Path):
+    path = tmp_path / "deck.pptx"
+    _make_pptx(path, "Q3 Roadmap", "Ship the new indexer", notes="Mention the GPU work")
+    extractor = get_extractor(str(path))
+    result = await extractor.extract(str(path))
+    assert result.source == "native"
+    assert "Q3 Roadmap" in result.text
+    assert "Ship the new indexer" in result.text
+    assert "Mention the GPU work" in result.text
+
+
+@pytest.mark.asyncio
+async def test_pptx_extractor_handles_corrupt_file(tmp_path: Path):
+    path = tmp_path / "broken.pptx"
+    path.write_bytes(b"not a real pptx")
+    extractor = get_extractor(str(path))
+    result = await extractor.extract(str(path))
+    assert result.text == ""
+    assert result.source == "native"
+
+
+# --- xlsx ---
+
+
+def _make_xlsx(path: Path, sheets: dict[str, list[list[object]]]) -> None:
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    wb.remove(wb.active)  # drop the default empty sheet
+    for name, rows in sheets.items():
+        ws = wb.create_sheet(title=name)
+        for row in rows:
+            ws.append(row)
+    wb.save(str(path))
+
+
+@pytest.mark.asyncio
+async def test_xlsx_extractor_reads_cells_and_sheet_titles(tmp_path: Path):
+    path = tmp_path / "book.xlsx"
+    _make_xlsx(
+        path,
+        {
+            "May": [["Name", "Hours"], ["Asha", 40], ["Ben", 38]],
+            "Notes": [["Reconcile with HR"]],
+        },
+    )
+    extractor = get_extractor(str(path))
+    result = await extractor.extract(str(path))
+    assert result.source == "native"
+    assert "May" in result.text
+    assert "Asha" in result.text
+    assert "40" in result.text
+    assert "Reconcile with HR" in result.text
+
+
+@pytest.mark.asyncio
+async def test_xlsx_extractor_handles_corrupt_file(tmp_path: Path):
+    path = tmp_path / "broken.xlsx"
+    path.write_bytes(b"not a real xlsx")
+    extractor = get_extractor(str(path))
+    result = await extractor.extract(str(path))
+    assert result.text == ""
+    assert result.source == "native"
+
+
+# --- legacy .xls (xlrd) ---
+
+
+def _make_xls(path: Path, sheet_name: str, rows: list[list[object]]) -> None:
+    import xlwt
+
+    wb = xlwt.Workbook()
+    ws = wb.add_sheet(sheet_name)
+    for r, row in enumerate(rows):
+        for c, val in enumerate(row):
+            ws.write(r, c, val)
+    wb.save(str(path))
+
+
+@pytest.mark.asyncio
+async def test_xls_extractor_reads_cells(tmp_path: Path):
+    path = tmp_path / "legacy.xls"
+    _make_xls(path, "Sheet1", [["Name", "Hours"], ["Asha", 40], ["Ben", 38]])
+    extractor = get_extractor(str(path))
+    result = await extractor.extract(str(path))
+    assert result.source == "native"
+    assert "Sheet1" in result.text
+    assert "Asha" in result.text
+    assert "40" in result.text
+
+
+@pytest.mark.asyncio
+async def test_xls_extractor_handles_corrupt_file(tmp_path: Path):
+    path = tmp_path / "broken.xls"
+    path.write_bytes(b"not a real xls")
+    extractor = get_extractor(str(path))
+    result = await extractor.extract(str(path))
+    assert result.text == ""
+    assert result.source == "native"
+
+
+# --- legacy .ppt (olefile + atom parsing) ---
+
+
+def _ppt_record(ver_inst: int, rec_type: int, payload: bytes) -> bytes:
+    import struct
+
+    return struct.pack("<HHI", ver_inst, rec_type, len(payload)) + payload
+
+
+def test_extract_ppt_text_decodes_text_atoms():
+    from ai_file_brain.core.extraction.ppt import extract_ppt_text
+
+    # A TextBytesAtom (0x0FA8, Latin-1) and a TextCharsAtom (0x0FA0, UTF-16LE),
+    # both nested inside a container record (recVer nibble == 0xF).
+    bytes_atom = _ppt_record(0x0000, 0x0FA8, b"Hello legacy slide")
+    chars_atom = _ppt_record(0x0000, 0x0FA0, "Second line".encode("utf-16-le"))
+    container = _ppt_record(0x000F, 0x0FF0, bytes_atom + chars_atom)
+
+    text = extract_ppt_text(container)
+    assert "Hello legacy slide" in text
+    assert "Second line" in text
+
+
+def test_extract_ppt_text_handles_garbage():
+    from ai_file_brain.core.extraction.ppt import extract_ppt_text
+
+    assert extract_ppt_text(b"\x00\x01\x02not really records") == ""
+
+
+@pytest.mark.asyncio
+async def test_ppt_extractor_handles_non_ole_file(tmp_path: Path):
+    path = tmp_path / "broken.ppt"
+    path.write_bytes(b"not an OLE2 file")
+    extractor = get_extractor(str(path))
+    result = await extractor.extract(str(path))
+    assert result.text == ""
+    assert result.source == "native"
+
+
+@pytest.mark.asyncio
+async def test_ppt_extractor_handles_missing_file(tmp_path: Path):
+    fake = tmp_path / "ghost.ppt"
+    extractor = get_extractor(str(fake))
+    result = await extractor.extract(str(fake))
+    assert result.text == ""
+    assert result.source == "native"
+
+
+# --- legacy .doc (olefile + piece-table parsing) ---
+
+
+def _build_doc_streams(pieces: list[tuple[str, bool]]) -> tuple[bytes, bytes]:
+    """Hand-build minimal WordDocument + table streams for a list of
+    (text, compressed) pieces, exercising the real piece-table parser."""
+    import struct
+
+    word = bytearray(0x2000)
+    struct.pack_into("<H", word, 0x0000, 0xA5EC)  # wIdent
+    struct.pack_into("<H", word, 0x000A, 0x0000)  # flags -> 0Table
+
+    cps = [0]
+    pcds = bytearray()
+    text_off = 0x400
+    for text, compressed in pieces:
+        cch = len(text)
+        cps.append(cps[-1] + cch)
+        if compressed:
+            word[text_off : text_off + cch] = text.encode("cp1252")
+            fc_raw = 0x40000000 | (text_off * 2)
+            text_off += cch + 4
+        else:
+            raw = text.encode("utf-16-le")
+            word[text_off : text_off + len(raw)] = raw
+            fc_raw = text_off
+            text_off += len(raw) + 4
+        pcds += struct.pack("<HIH", 0, fc_raw, 0)  # flags, fc, prm
+
+    plcfpcd = b"".join(struct.pack("<I", cp) for cp in cps) + bytes(pcds)
+    clx = bytes([0x02]) + struct.pack("<I", len(plcfpcd)) + plcfpcd
+    struct.pack_into("<I", word, 0x01A2, 0)  # fcClx
+    struct.pack_into("<I", word, 0x01A6, len(clx))  # lcbClx
+    return bytes(word), clx
+
+
+def test_extract_doc_text_stitches_compressed_and_unicode_pieces():
+    from ai_file_brain.core.extraction.doc import extract_doc_text
+
+    word, table = _build_doc_streams([("Hello DOC ", True), ("wide piece", False)])
+    text = extract_doc_text(word, table)
+    assert "Hello DOC" in text
+    assert "wide piece" in text
+
+
+def test_extract_doc_text_rejects_non_word_stream():
+    from ai_file_brain.core.extraction.doc import extract_doc_text
+
+    assert extract_doc_text(b"\x00" * 500, b"") == ""
+
+
+def test_doc_table_stream_name_follows_flag():
+    import struct
+
+    from ai_file_brain.core.extraction.doc import table_stream_name
+
+    word = bytearray(16)
+    struct.pack_into("<H", word, 0x0A, 0x0200)
+    assert table_stream_name(bytes(word)) == "1Table"
+    struct.pack_into("<H", word, 0x0A, 0x0000)
+    assert table_stream_name(bytes(word)) == "0Table"
+
+
+@pytest.mark.asyncio
+async def test_doc_extractor_handles_non_ole_file(tmp_path: Path):
+    path = tmp_path / "broken.doc"
+    path.write_bytes(b"not an OLE2 file")
+    extractor = get_extractor(str(path))
+    result = await extractor.extract(str(path))
+    assert result.text == ""
+    assert result.source == "native"
+
+
+@pytest.mark.asyncio
+async def test_doc_extractor_handles_missing_file(tmp_path: Path):
+    fake = tmp_path / "ghost.doc"
     extractor = get_extractor(str(fake))
     result = await extractor.extract(str(fake))
     assert result.text == ""

@@ -3,10 +3,15 @@ from __future__ import annotations
 import os
 from typing import Protocol, runtime_checkable
 
+from ai_file_brain.core.extraction.doc import DocExtractor
 from ai_file_brain.core.extraction.docx import DocxExtractor
 from ai_file_brain.core.extraction.image import ImageExtractor
 from ai_file_brain.core.extraction.pdf import PdfExtractor
 from ai_file_brain.core.extraction.plain_text import PlainTextExtractor
+from ai_file_brain.core.extraction.ppt import PptExtractor
+from ai_file_brain.core.extraction.pptx import PptxExtractor
+from ai_file_brain.core.extraction.xls import XlsExtractor
+from ai_file_brain.core.extraction.xlsx import XlsxExtractor
 from ai_file_brain.core.models import ExtractionResult
 
 
@@ -62,6 +67,11 @@ _PLAIN_TEXT_EXTENSIONS: tuple[str, ...] = (
 _EXTRACTORS: dict[str, TextExtractor] = {
     ".pdf": PdfExtractor(),
     ".docx": DocxExtractor(),
+    ".doc": DocExtractor(),
+    ".pptx": PptxExtractor(),
+    ".ppt": PptExtractor(),
+    ".xlsx": XlsxExtractor(),
+    ".xls": XlsExtractor(),
     ".png": _image_extractor,
     ".jpg": _image_extractor,
     ".jpeg": _image_extractor,

@@ -19,7 +19,8 @@ top_k = 5
 max_match_distance = 0.5
 max_filename_match_distance = 0.85
 
-# OCR — image files and scanned-PDF fallback.
+# OCR — scanned-PDF fallback only. Image files are name-only this phase (see
+# name_only_extensions below), so this no longer affects images.
 ocr_enabled = true
 ocr_languages = ["en"]
 pdf_ocr_min_native_chars = 50      # below this total, switch to per-page OCR fallback
@@ -29,6 +30,26 @@ pdf_ocr_render_dpi = 220
 # Hard upper bound on per-file size before indexing. Skips runaway lockfiles,
 # generated bundles, etc. 10 MiB by default.
 max_file_size_bytes = 10485760
+
+# How many files are indexed (extracted + embedded) at once during bulk scans.
+# Keeps a huge watch root from flooding Ollama / exhausting memory.
+max_concurrent_indexing = 4
+
+# --- What gets indexed, in two tiers; anything in neither list is ignored. ---
+# Tier 1 — full content extracted, chunked and embedded (needs an extractor).
+content_extensions = [".txt", ".md", ".rst", ".pdf", ".docx", ".pptx", ".xlsx", ".ppt", ".xls", ".doc"]
+# Tier 2 — filename only (name embedded as a stub, contents not read). Code,
+# images (OCR off this phase), and a few extra doc/media/archive types.
+name_only_extensions = [
+    # source code — names only for now
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".cs", ".go", ".rs",
+    ".rb", ".php", ".c", ".cpp", ".cc", ".h", ".hpp", ".sh", ".bash",
+    ".ps1", ".sql",
+    # images — OCR disabled this phase, so name-only
+    ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp", ".gif",
+    # extra media / archives, by name
+    ".mp4", ".zip",
+]
 
 # Smart exclusions: any path containing one of these directory names is
 # skipped (case-insensitive). Edit this list in user-settings.toml to add

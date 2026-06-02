@@ -7,13 +7,19 @@ A local-first desktop app that watches a folder, indexes your files into a local
 **Indexing & extraction**
 
 - Real-time file watcher (initial recursive scan + debounced create/modify/delete/move events)
-- Plain text · `.txt .md .rst`
-- PDF · `pypdf` fast path with **per-page OCR fallback** for scanned and mixed PDFs
-- DOCX · paragraphs, tables, and headers/footers
-- Source code · `.py .js .ts .tsx .jsx .java .cs .go .rs .rb .php .c .cpp .cc .h .hpp .sh .bash .ps1 .sql`
-- Config / data · `.yml .yaml .toml .json .ini .cfg .env`
-- Images via OCR · `.png .jpg .jpeg .tif .tiff .bmp .webp` (multi-page TIFFs OCR every page; animated GIFs first frame only)
-- Per-chunk `extraction_source` metadata (`native | ocr | mixed`) carried through the vector store
+- **Large watch roots are safe** — the initial scan runs off the UI thread, prunes excluded directories *before descending* (so a tree like `C:\` never enumerates `Windows`/`node_modules`/`AppData`), and feeds a bounded worker pool so indexing can't flood Ollama or exhaust memory
+- **Two indexing tiers, fully config-driven** (anything in neither list is ignored):
+  - **Full content** (`content_extensions`) — opened, text extracted, chunked, embedded:
+    - Plain text · `.txt .md .rst`
+    - PDF · `pypdf` fast path with **per-page OCR fallback** for scanned and mixed PDFs
+    - Word · `.docx` (paragraphs, tables, headers/footers) and legacy `.doc` (FIB + piece-table parsing)
+    - PowerPoint · `.pptx` (slide text, tables, speaker notes) and legacy `.ppt` (OLE text atoms)
+    - Excel · `.xlsx` (`openpyxl`) and legacy `.xls` (`xlrd`) — cell values across every sheet, sheet titles preserved
+  - **Filename only** (`name_only_extensions`) — just the file *name* is embedded as a stub so it's findable by name, contents not read:
+    - Source code · `.py .js .ts .tsx .jsx .java .cs .go .rs .rb .php .c .cpp .cc .h .hpp .sh .bash .ps1 .sql`
+    - Images · `.png .jpg .jpeg .tif .tiff .bmp .webp .gif` (image OCR is **off** this phase — name only)
+    - Media / archives · `.mp4 .zip`
+- Per-chunk `extraction_source` metadata (`native | ocr | mixed | filename_only`) carried through the vector store; filename-only stubs are excluded from semantic content search
 
 **Retrieval & chat**
 
@@ -31,10 +37,12 @@ A local-first desktop app that watches a folder, indexes your files into a local
 
 **Safety / config knobs**
 
-- **Smart exclusions** — directory-name and extension skip lists, with sensible Windows defaults (`AppData`, `node_modules`, `.git`, `__pycache__`, `.venv`, `dist`, `build`, `.lock`, `.pyc`…)
+- **Two-tier indexing** — `content_extensions` (full text) and `name_only_extensions` (filename stub); anything in neither is skipped entirely
+- **Smart exclusions** — directory-name and extension skip lists, with sensible Windows defaults (`AppData`, `node_modules`, `.git`, `__pycache__`, `.venv`, `dist`, `build`, `.lock`, `.pyc`…); exclusions win over both tiers
+- `max_concurrent_indexing` (4 default) bounds how many files are extracted/embedded at once so a huge watch root can't overwhelm the machine
 - `max_file_size_bytes` cap (10 MiB default) defangs runaway lockfiles and generated bundles
-- `ocr_enabled` kill switch reverts behaviour to text-only exactly
-- `pdf_ocr_min_native_chars`, `pdf_ocr_per_page_min_chars`, `pdf_ocr_render_dpi` for the OCR fallback
+- `ocr_enabled` governs the **scanned-PDF** OCR fallback (image OCR is off this phase — images are name-only)
+- `pdf_ocr_min_native_chars`, `pdf_ocr_per_page_min_chars`, `pdf_ocr_render_dpi` for the PDF OCR fallback
 - All settings overridable via `AFB_*` environment variables
 
 ## Stack
@@ -44,8 +52,8 @@ A local-first desktop app that watches a folder, indexes your files into a local
 - ChromaDB `PersistentClient` for the vector store
 - Ollama for embeddings (`nomic-embed-text`) and chat (`llama3.2`)
 - `watchdog` for file events
-- `pypdf` + `python-docx` for native text extraction
-- `rapidocr-onnxruntime` + `PyMuPDF` + `Pillow` for OCR (no external binaries)
+- `pypdf` + `python-docx` + `python-pptx` + `openpyxl` for modern formats; `xlrd` + `olefile` for legacy `.xls` / `.ppt` / `.doc`
+- `rapidocr-onnxruntime` + `PyMuPDF` + `Pillow` for scanned-PDF OCR (no external binaries)
 - PyInstaller for the single-folder build
 
 ## Prerequisites
@@ -76,13 +84,16 @@ Notable settings:
 | `watch_folder` | `C:/Users/ASUS/Documents/AIFileBrainTest` | Folder watched recursively |
 | `chunk_size` / `chunk_overlap` | `2000` / `400` | Character-window chunking |
 | `top_k` | `5` | Number of retrieved chunks fed to the LLM |
-| `ocr_enabled` | `true` | OCR for images and scanned PDFs |
+| `content_extensions` | `.txt .md .rst .pdf .docx .pptx .xlsx .doc .ppt .xls` | Extensions whose **content** is extracted, chunked, and embedded |
+| `name_only_extensions` | code, images, `.mp4 .zip` | Extensions indexed by **filename only** (a stub); anything in neither list is ignored |
+| `max_concurrent_indexing` | `4` | Max files extracted/embedded at once during scans |
+| `ocr_enabled` | `true` | OCR fallback for **scanned PDFs** (image OCR is off this phase) |
 | `pdf_ocr_min_native_chars` | `50` | Below this total native text, OCR fallback engages |
 | `pdf_ocr_per_page_min_chars` | `10` | Below this on a page (in fallback mode), the page is OCR'd |
 | `pdf_ocr_render_dpi` | `220` | DPI for PDF page rendering before OCR |
 | `max_file_size_bytes` | `10485760` (10 MiB) | Files larger than this are skipped |
-| `excluded_dir_names` | see `settings.toml` | Path components that mark a file as ignored |
-| `excluded_extensions` | `.lock .pyc .pyo .log .tmp .bak` | Extensions never indexed |
+| `excluded_dir_names` | see `settings.toml` | Path components that mark a file as ignored (wins over both tiers) |
+| `excluded_extensions` | `.lock .pyc .pyo .log .tmp .bak .ps1` | Extensions never indexed (wins over both tiers) |
 
 ## Run
 
@@ -96,14 +107,14 @@ The app opens a chat window and parks itself in the system tray. Closing the win
 
 ## Try it out
 
-Drop a screenshot, scanned receipt, Word doc, source file, or PDF into your watch folder. Within seconds it will appear in the tray's "Indexing …" line; once indexed, ask the chat things like:
+Drop a Word doc, PDF, Markdown note, or text file in for full-text search — or any code file, image, spreadsheet, or zip to make it findable by name. Within seconds it will appear in the tray's "Indexing …" line; once indexed, ask the chat things like:
 
-- "Summarise the receipts I added this week"
-- "What was I working on yesterday?"
-- "Where do I initialise the OCR engine?"
-- "Pull the action items out of last month's meeting notes"
+- "Summarise the meeting notes I added this week" *(full content)*
+- "What was I working on yesterday?" *(temporal)*
+- "Do I have anything about the Q3 budget?" *(matches content and filenames)*
+- "Pull the action items out of last month's meeting notes" *(full content)*
 
-Set `ocr_enabled = false` in `user-settings.toml` if you want to revert to text-only behaviour.
+This phase indexes document **content** (`.txt .md .rst .pdf .docx .pptx .xlsx .doc .ppt .xls`); code, images, and a few extra types are findable by **name only** (their contents aren't read). Adjust `content_extensions` / `name_only_extensions` in `user-settings.toml` to change what's indexed.
 
 ## Test
 

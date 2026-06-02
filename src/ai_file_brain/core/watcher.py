@@ -23,7 +23,10 @@ from watchdog.observers import Observer
 from ai_file_brain.config import AiFileBrainSettings
 from ai_file_brain.core.chunking import ChunkingService
 from ai_file_brain.core.embedding import EmbeddingService
-from ai_file_brain.core.exclusions import is_excluded
+from ai_file_brain.core.exclusions import (
+    classify_path,
+    prune_excluded_dirs,
+)
 from ai_file_brain.core.extraction import get_extractor, is_supported
 from ai_file_brain.core.models import FileChunk
 from ai_file_brain.core.storage import VectorRepository, _under_watch_folder
@@ -33,6 +36,12 @@ logger = logging.getLogger(__name__)
 DEBOUNCE_SECONDS = 0.5
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
+
+# Bulk-scan throttling. The threaded directory walk ships files to the indexing
+# workers in batches through a bounded queue; when the queue is full the walk
+# blocks (back-pressure) instead of piling millions of paths into memory.
+SCAN_BATCH_SIZE = 200
+INDEX_QUEUE_MAXSIZE = 1000
 
 
 ProgressCallback = Callable[["IndexingProgress"], None]
@@ -75,16 +84,23 @@ class IndexingPipeline:
         self._embedder = embedder
         self._repo = repo
         self._settings = settings
+        self._content_exts = frozenset(e.lower() for e in settings.content_extensions)
+
+    def _is_content(self, file_path: str) -> bool:
+        """A file is content-indexed only if it's in ``content_extensions`` AND
+        actually has a registered extractor; otherwise it falls back to a stub."""
+        ext = os.path.splitext(file_path)[1].lower()
+        return ext in self._content_exts and is_supported(file_path)
 
     async def index_file(self, file_path: str) -> int:
         for attempt, backoff in enumerate(RETRY_BACKOFF_SECONDS, start=1):
             try:
-                if is_supported(file_path):
+                if self._is_content(file_path):
                     return await self._index_supported_once(file_path)
-                # Unsupported extension (.zip, .exe, .mp4 …): store a tiny
-                # filename-only stub so substring search ("do I have files
-                # about <X>") can still find it. Excluded from semantic
-                # search via metadata filter in the repo layer.
+                # Name-only tier (code, images this phase, .xlsx/.mp4/.zip …):
+                # store a tiny filename-only stub so substring / name search can
+                # still find it. Excluded from semantic content search via a
+                # metadata filter in the repo layer.
                 return await self._index_filename_only_once(file_path)
             except FileNotFoundError:
                 logger.info("File disappeared before indexing: %s", file_path)
@@ -233,6 +249,15 @@ class FileWatcherService:
         self._debouncers: dict[str, asyncio.TimerHandle] = {}
         self._tasks: set[asyncio.Task] = set()
         self._running = False
+        # Bounded work queue + fixed worker pool drain bulk scans so a giant
+        # watch root can't spawn unbounded indexing tasks. Live file events stay
+        # on the direct task path (they're naturally low-rate).
+        self._index_queue: asyncio.Queue[str] | None = None
+        self._workers: list[asyncio.Task] = []
+        self._concurrency = max(1, settings.max_concurrent_indexing)
+        # Precompute the tier sets once; consulted per file during scans/events.
+        self._content_exts = frozenset(e.lower() for e in settings.content_extensions)
+        self._name_only_exts = frozenset(e.lower() for e in settings.name_only_extensions)
 
     async def start(self) -> None:
         if self._running:
@@ -244,7 +269,16 @@ class FileWatcherService:
         self._observer.schedule(self._handler, self._settings.watch_folder, recursive=True)
         self._observer.start()
         self._running = True
-        logger.info("Watching %s", self._settings.watch_folder)
+        # Start the bounded indexing worker pool before any scan can enqueue work.
+        self._index_queue = asyncio.Queue(maxsize=INDEX_QUEUE_MAXSIZE)
+        self._workers = [
+            self._loop.create_task(self._index_worker()) for _ in range(self._concurrency)
+        ]
+        logger.info(
+            "Watching %s (indexing concurrency=%d)",
+            self._settings.watch_folder,
+            self._concurrency,
+        )
         # Run the initial scan in the background so a large watch root (e.g. D:\)
         # doesn't block the UI from coming up. Tracked in _tasks so stop() cancels it.
         self._schedule_task(self._initial_scan())
@@ -262,6 +296,10 @@ class FileWatcherService:
         self._debouncers.clear()
         for task in list(self._tasks):
             task.cancel()
+        for worker in self._workers:
+            worker.cancel()
+        self._workers.clear()
+        self._index_queue = None
         if self._observer:
             self._observer.stop()
             self._observer.join(timeout=2.0)
@@ -303,11 +341,16 @@ class FileWatcherService:
             self._debounce_index(src)
 
     def _should_track(self, path: str) -> bool:
-        """Any non-excluded file is tracked. Files without a text extractor get
-        a filename-only stub in the index so substring search can still find
-        them."""
-        return not is_excluded(
+        """Track a file only if it falls in a configured indexing tier
+        (``content_extensions`` or ``name_only_extensions``) and isn't excluded.
+        Everything else — config/data files, unknown binaries — is ignored."""
+        return self._classify(path) is not None
+
+    def _classify(self, path: str) -> str | None:
+        return classify_path(
             path,
+            self._content_exts,
+            self._name_only_exts,
             self._settings.excluded_dir_names,
             self._settings.excluded_extensions,
         )
@@ -377,31 +420,85 @@ class FileWatcherService:
         if new_dir and _under_watch_folder(new_dir, self._settings.watch_folder):
             await self._scan_and_index(new_dir)
 
-    async def _scan_and_index(self, root: str) -> None:
-        try:
-            paths = await asyncio.to_thread(self._list_files, root)
-        except OSError as ex:
-            logger.warning("Scan of %s failed: %s", root, ex)
+    async def _index_worker(self) -> None:
+        """Drain the bulk-scan queue, indexing at most ``_concurrency`` files at
+        once. Runs for the life of the watcher; cancelled in ``stop()``."""
+        queue = self._index_queue
+        if queue is None:
+            return
+        while True:
+            file_path = await queue.get()
+            try:
+                await self._index(file_path)
+            except Exception:
+                logger.exception("Worker indexing failed for %s", file_path)
+            finally:
+                queue.task_done()
+
+    async def _enqueue_scanned(self, paths: list[str]) -> None:
+        """Put a batch of scanned paths onto the bounded work queue, skipping
+        ones already indexed. ``queue.put`` blocks when the queue is full, which
+        is what throttles the producer walk."""
+        queue = self._index_queue
+        if queue is None:
             return
         for file_path in paths:
-            if self._should_track(file_path):
-                self._schedule_task(self._index(file_path))
-
-    async def _initial_scan(self) -> None:
-        folder = Path(self._settings.watch_folder)
-        for path in folder.rglob("*"):
-            if not path.is_file():
-                continue
-            file_path = str(path)
-            if not self._should_track(file_path):
-                continue
             try:
-                already = await self._repo.has_path(file_path)
+                if await self._repo.has_path(file_path):
+                    continue
             except Exception as ex:
                 logger.warning("has_path check failed for %s: %s", file_path, ex)
-                already = False
-            if not already:
-                self._schedule_task(self._index(file_path))
+            await queue.put(file_path)
+
+    def _produce_to_queue(self, root: str) -> None:
+        """Walk ``root`` in a worker thread, pruning excluded subtrees, and ship
+        trackable files to the indexing queue in batches. Runs off the event
+        loop so a giant tree (e.g. C:\\) never blocks the UI; back-pressure from
+        the bounded queue keeps memory flat. Called via ``asyncio.to_thread``."""
+        loop = self._loop
+        if loop is None:
+            return
+
+        def ship(batch: list[str]) -> None:
+            # Hop back onto the event loop to enqueue, and block this thread until
+            # it's done so a full queue throttles the walk instead of buffering.
+            asyncio.run_coroutine_threadsafe(self._enqueue_scanned(batch), loop).result()
+
+        batch: list[str] = []
+        for file_path in self._walk_trackable(root):
+            batch.append(file_path)
+            if len(batch) >= SCAN_BATCH_SIZE:
+                if not self._running:
+                    return
+                ship(batch)
+                batch = []
+        if batch and self._running:
+            ship(batch)
+
+    def _walk_trackable(self, root: str):
+        """Yield indexable file paths under ``root``, pruning excluded directories
+        *before descending* so we never enumerate the files inside them. Only
+        files in a configured indexing tier are yielded."""
+        excluded_dirs = self._settings.excluded_dir_names
+
+        def _on_error(err: OSError) -> None:
+            logger.debug("Skipping unreadable path during scan: %s", err)
+
+        for dirpath, dirnames, filenames in os.walk(root, topdown=True, onerror=_on_error):
+            dirnames[:] = prune_excluded_dirs(dirnames, excluded_dirs)
+            for name in filenames:
+                file_path = os.path.join(dirpath, name)
+                if self._classify(file_path) is not None:
+                    yield file_path
+
+    async def _scan_and_index(self, root: str) -> None:
+        try:
+            await asyncio.to_thread(self._produce_to_queue, root)
+        except OSError as ex:
+            logger.warning("Scan of %s failed: %s", root, ex)
+
+    async def _initial_scan(self) -> None:
+        await self._scan_and_index(self._settings.watch_folder)
 
     async def _reconcile_index(self) -> None:
         """Drop index entries for watched files that no longer exist on disk.
@@ -431,11 +528,6 @@ class FileWatcherService:
         for file_path in missing:
             logger.info("Reconcile: dropping vanished file from index: %s", file_path)
             self._schedule_task(self._handle_delete(file_path))
-
-    @staticmethod
-    def _list_files(root: str) -> list[str]:
-        base = Path(root)
-        return [str(p) for p in base.rglob("*") if p.is_file()]
 
     def _notify(self, progress: IndexingProgress) -> None:
         if self._progress is None:

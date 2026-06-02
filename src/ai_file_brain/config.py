@@ -46,6 +46,45 @@ class AiFileBrainSettings(BaseSettings):
 
     max_file_size_bytes: int = 10 * 1024 * 1024
 
+    # Upper bound on how many files are indexed (extracted + embedded) at once.
+    # Bulk scans feed a bounded work queue drained by this many workers, so a
+    # huge watch root (e.g. C:\) can't spawn millions of concurrent tasks and
+    # flood Ollama / exhaust memory. Raise for faster indexing on beefy boxes;
+    # lower to be gentler on the machine while you keep working.
+    max_concurrent_indexing: int = 4
+
+    # --- What gets indexed, in two tiers (anything in neither list is ignored) ---
+    #
+    # Tier 1 — full content: the file is opened, its text extracted, chunked and
+    # embedded. Only extensions with a registered extractor work here; an entry
+    # without one silently falls back to a filename-only stub.
+    content_extensions: list[str] = [
+        ".txt",
+        ".md",
+        ".rst",
+        ".pdf",
+        ".docx",
+        ".pptx",
+        ".xlsx",
+        ".ppt",
+        ".xls",
+        ".doc",
+    ]
+    # Tier 2 — filename only: no content is read; just the file's name is
+    # embedded so it's findable by name. Used for files we can't (or choose not
+    # to) read this phase — code, images (OCR off), and a few extra doc/media/
+    # archive types. Everything not in either list is skipped entirely.
+    name_only_extensions: list[str] = [
+        # source code — names only for now
+        ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".cs", ".go", ".rs",
+        ".rb", ".php", ".c", ".cpp", ".cc", ".h", ".hpp", ".sh", ".bash",
+        ".ps1", ".sql",
+        # images — OCR disabled this phase, so name-only
+        ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp", ".gif",
+        # extra media / archives, by name
+        ".mp4", ".zip",
+    ]
+
     # Names of directories that, if they appear anywhere in a path, cause the
     # file to be skipped. Case-insensitive. Designed for noisy / private dirs
     # that no user wants indexed.
