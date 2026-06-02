@@ -16,7 +16,7 @@ top_k = 5
 # up as "sources" and a topic with no real match returns a clean "not found".
 # Lower = stricter. Filename-only stubs (.exe, .m4a …) embed just the name's
 # words, so they get a looser ceiling.
-max_match_distance = 0.6
+max_match_distance = 0.5
 max_filename_match_distance = 0.85
 
 # OCR — image files and scanned-PDF fallback.

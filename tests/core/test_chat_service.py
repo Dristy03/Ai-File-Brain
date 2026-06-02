@@ -457,6 +457,77 @@ async def test_conceptual_query_surfaces_filename_only_semantic_match():
 
 
 @pytest.mark.asyncio
+async def test_empty_retrieval_with_history_still_calls_llm():
+    """A follow-up whose own retrieval finds nothing must still reach the LLM so
+    it can answer from the earlier conversation — e.g. 'what's the second-half
+    start time?' after the attendance doc was already surfaced. Without this it
+    dead-ends on 'couldn't find' before the model ever sees the history."""
+    repo = FakeRepo(hits=[])  # current retrieval returns nothing
+    ollama = FakeOllama(["2:00 PM"])
+    chat = ChatService(_settings(), FakeEmbedder(), repo, ollama)
+    # Seed a prior turn as if the attendance doc was surfaced earlier.
+    chat._history = [
+        {"role": "user", "content": "Attendence.docx — second half starts at 2:00 PM"},
+        {"role": "assistant", "content": "The attendance policy covers office hours."},
+    ]
+
+    result = await chat.ask("what is the second half starting time of office?")
+
+    assert ollama.last_kwargs is not None, "LLM should be called so it can use history"
+    assert result.answer == "2:00 PM"
+    assert result.sources == ()
+
+
+@pytest.mark.asyncio
+async def test_empty_retrieval_without_history_says_not_found():
+    """With no fresh matches AND no prior conversation, still say 'couldn't find'
+    rather than calling the LLM with nothing to ground on."""
+    repo = FakeRepo(hits=[])
+    ollama = FakeOllama(["should not be used"])
+    chat = ChatService(_settings(), FakeEmbedder(), repo, ollama)
+
+    result = await chat.ask("is there any file on quantum widgets?")
+
+    assert ollama.last_kwargs is None, "LLM must NOT be called when nothing to ground on"
+    assert "couldn't find" in result.answer
+
+
+@pytest.mark.asyncio
+async def test_filename_only_junk_dropped_when_content_matches():
+    """Filename-only stubs (installers, runtimes, archives) must not pad the
+    sources when real content matched. They're kept only if at least as close as
+    the best content hit, so unrelated binaries sitting just under the loose
+    filename ceiling stop showing up as 'sources'."""
+    content = QueryHit(
+        chunk_id="c",
+        file_path="/dl/Attendence.docx",
+        file_name="Attendence.docx",
+        chunk_index=0,
+        text="office hours and attendance policy",
+        distance=0.36,
+        modified_at=datetime(2026, 5, 1, tzinfo=UTC),
+    )
+    junk = QueryHit(
+        chunk_id="j",
+        file_path="/dl/Git-2.54.0-64-bit.exe",
+        file_name="Git-2.54.0-64-bit.exe",
+        chunk_index=0,
+        text="Git-2.54.0-64-bit.exe",
+        distance=0.53,  # closer than the loose filename ceiling, but worse than content
+        modified_at=datetime(2026, 5, 1, tzinfo=UTC),
+        extraction_source="filename_only",
+    )
+    repo = FakeRepo(hits=[content])
+    repo.filename_only_hits = [junk]
+    chat = ChatService(_settings(), FakeEmbedder(), repo, FakeOllama(["ok"]))
+
+    result = await chat.ask("is there any files on office timings?")
+
+    assert "/dl/Attendence.docx" in result.sources
+    assert "/dl/Git-2.54.0-64-bit.exe" not in result.sources
+
+
+@pytest.mark.asyncio
 async def test_recency_intent_beats_time_window():
     # "latest" should pick recency, not interpret "last 7 days" or similar.
     recent = [QueryHit("1", "/x.txt", "x.txt", 0, "x", 0.0, datetime(2026, 5, 10, tzinfo=UTC))]

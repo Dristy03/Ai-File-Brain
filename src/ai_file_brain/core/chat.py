@@ -223,6 +223,20 @@ class ChatService:
                     modified_at_range=modified_range,
                 ),
             )
+            # Filename-only stubs (unsupported binaries: .exe, .zip, .appx …)
+            # carry a weaker signal than real content — their vector is just the
+            # filename's words — so on a content-rich query they crowd in as junk
+            # "sources" (installers, runtimes) at distances just under the loose
+            # filename ceiling. Only let a filename-only semantic match through
+            # when it's at least as close as the best real-content match. With no
+            # content match (best_content is None) they pass freely, so the
+            # concept->filename bridge ("office timings" -> "attendance.xlsx" when
+            # that file has no indexed body) still works.
+            best_content = min((h.distance for h in sem_hits), default=None)
+            if best_content is not None:
+                fname_sem_hits = [
+                    h for h in fname_sem_hits if h.distance <= best_content
+                ]
             # Priority order: literal name match (high precision), then content
             # semantic, then filename semantic. Dedupe by path, cap at top_k so
             # the LLM context stays tight.
@@ -238,14 +252,27 @@ class ChatService:
         if not hits:
             if recency is not None:
                 yield TokenChunk(text="I haven't indexed any files yet.")
-            elif window is not None:
+                yield SourcesChunk(paths=())
+                return
+            if window is not None:
                 yield TokenChunk(
                     text=f"I couldn't find any files modified during {window.label}."
                 )
-            else:
-                yield TokenChunk(text="I couldn't find any relevant content in your files.")
-            yield SourcesChunk(paths=())
-            return
+                yield SourcesChunk(paths=())
+                return
+            if not self._history:
+                # Nothing retrieved and no prior conversation to lean on.
+                yield TokenChunk(
+                    text="I couldn't find any relevant content in your files."
+                )
+                yield SourcesChunk(paths=())
+                return
+            # No fresh matches, but this may be a follow-up about a file we
+            # surfaced earlier — e.g. "what's the second-half start time?" after
+            # the attendance doc was shown. The follow-up's own wording can embed
+            # too far from that file to re-retrieve it, so rather than dead-end on
+            # "couldn't find", fall through and let the LLM answer from the
+            # conversation history (which still holds the earlier excerpts).
 
         # Emit sources EARLY so the UI can show "considering these files"
         # while the LLM is still loading and prefilling.
@@ -259,12 +286,13 @@ class ChatService:
         for hit in hits:
             if hit.file_name and hit.file_name not in unique_names:
                 unique_names.append(hit.file_name)
-        preview = ", ".join(unique_names[:3])
-        if len(unique_names) > 3:
-            preview += f" (+{len(unique_names) - 3} more)"
-        yield StatusChunk(
-            message=f"Reading {len(unique_names)} file(s): {preview}"
-        )
+        if unique_names:
+            preview = ", ".join(unique_names[:3])
+            if len(unique_names) > 3:
+                preview += f" (+{len(unique_names) - 3} more)"
+            yield StatusChunk(
+                message=f"Reading {len(unique_names)} file(s): {preview}"
+            )
 
         user_message = _build_user_message(question, hits, window, recency)
         system_prompt = RECENCY_SYSTEM_PROMPT if recency is not None else SYSTEM_PROMPT

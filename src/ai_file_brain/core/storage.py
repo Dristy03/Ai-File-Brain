@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
@@ -279,9 +280,15 @@ class ChromaVectorRepository:
     async def query_by_filename_substrings(
         self, substrings: list[str], n: int
     ) -> list[QueryHit]:
-        """Return up to ``n`` chunks whose ``file_name`` contains any of the
-        given substrings (case-insensitive). One chunk per matched file, the
-        lowest-index chunk first.
+        """Return up to ``n`` chunks whose ``file_name`` has a *word* starting
+        with any of the given keywords (case-insensitive). One chunk per matched
+        file, the lowest-index chunk first.
+
+        Matching is token-prefix, not raw substring: the filename is split on
+        separators and camelCase, and a keyword matches only if some token starts
+        with it. So "mcf" still surfaces "mcfcoreinstaller.zip", but "time" no
+        longer matches inside "Microsoft...Runtime...appx" — raw-substring
+        matching dragged unrelated binaries in as false positives.
 
         Used for "tell me about <name>" — embeddings can't link a query word
         like "screenshot" to a file whose chunk text doesn't contain it (think
@@ -325,6 +332,22 @@ class ChromaVectorRepository:
             return False
 
 
+_CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _filename_tokens(file_name: str) -> list[str]:
+    """Split a filename into lowercase word tokens on separators and camelCase.
+
+    'Microsoft.NET.Native.Runtime' -> ['microsoft','net','native','runtime'];
+    'mcfcoreinstaller.zip' -> ['mcfcoreinstaller','zip']. Powers token-prefix
+    filename matching: 'time' won't match inside 'runtime', but 'mcf' still
+    matches the start of 'mcfcoreinstaller'.
+    """
+    spaced = _CAMEL_BOUNDARY_RE.sub(" ", file_name).lower()
+    return [t for t in _NON_ALNUM_RE.split(spaced) if t]
+
+
 def _filter_by_filename(
     result: dict, needles: list[str], n: int, watch_folder: str
 ) -> list[QueryHit]:
@@ -343,8 +366,8 @@ def _filter_by_filename(
             continue
         if not _under_watch_folder(file_path, watch_folder):
             continue
-        name_lower = file_name.lower()
-        if not any(needle in name_lower for needle in needles):
+        tokens = _filename_tokens(file_name)
+        if not any(tok.startswith(needle) for tok in tokens for needle in needles):
             continue
         chunk_index = int(meta.get("chunk_index", 0) or 0)
         existing = best_per_path.get(file_path)

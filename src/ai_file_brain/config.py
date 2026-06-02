@@ -31,7 +31,7 @@ class AiFileBrainSettings(BaseSettings):
     # they reach the answer, so unrelated files stop appearing as "sources" and
     # a query with no real match returns a clean "not found". Tune lower for
     # stricter matching, higher to admit weaker matches.
-    max_match_distance: float = 0.6
+    max_match_distance: float = 0.5
     # Filename-only stubs (unsupported types: .exe, .m4a …) embed just the
     # filename's words, so their distances run higher than full-content chunks
     # for the same intent. Give them a looser ceiling so a name-based match
