@@ -40,11 +40,25 @@ class AiFileBrainSettings(BaseSettings):
 
     ocr_enabled: bool = True
     ocr_languages: list[str] = ["en"]
+    # Run OCR on the GPU via DirectML when available (any DX12 GPU, incl. Intel
+    # Arc). Falls back to CPU automatically if the DirectML runtime isn't
+    # installed (pip install onnxruntime-directml), so this is always safe to
+    # leave on. Note: shares the GPU with Ollama, so heavy OCR + chat at the same
+    # instant time-slice; set False to force CPU OCR if that ever matters.
+    ocr_use_gpu: bool = True
     pdf_ocr_min_native_chars: int = 50
     pdf_ocr_per_page_min_chars: int = 10
     pdf_ocr_render_dpi: int = 220
+    # Max pages to OCR per PDF (0 = unlimited). Pages are rendered + OCR'd one at a
+    # time, so memory is bounded regardless; this only caps worst-case CPU time on
+    # a huge scanned document. Raise/zero it if you need every page of giant scans.
+    pdf_ocr_max_pages: int = 0
 
-    max_file_size_bytes: int = 10 * 1024 * 1024
+    # Hard upper bound on per-file size before indexing. Mainly a backstop against
+    # runaway generated junk (lockfiles, bundles, DB dumps), NOT a memory guard:
+    # OCR streams page-by-page and text extraction is bounded, so large real
+    # documents are fine. 200 MiB by default; set 0 to disable the cap entirely.
+    max_file_size_bytes: int = 200 * 1024 * 1024
 
     # Upper bound on how many files are indexed (extracted + embedded) at once.
     # Bulk scans feed a bounded work queue drained by this many workers, so a

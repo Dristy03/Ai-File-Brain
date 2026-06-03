@@ -166,7 +166,8 @@ class IndexingPipeline:
             size = os.path.getsize(file_path)
         except OSError:
             return 0
-        if size > self._settings.max_file_size_bytes:
+        max_size = self._settings.max_file_size_bytes
+        if max_size > 0 and size > max_size:
             logger.info(
                 "Skipping %s: %d bytes exceeds max_file_size_bytes (%d)",
                 file_path,

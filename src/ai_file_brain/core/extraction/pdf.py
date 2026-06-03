@@ -33,30 +33,32 @@ class PdfExtractor:
                 source="native",
             )
 
-        # Fallback path: per-page OCR for sparse pages.
-        rendered = await asyncio.to_thread(
-            self._render_sparse_pages,
+        # Fallback path: per-page OCR for sparse pages. We render and OCR ONE page
+        # at a time (rather than rasterizing every sparse page up front), so memory
+        # stays at ~one page-image regardless of document length. At 220 DPI a
+        # single A4 page is ~25 MB in RAM; holding all of them for a 500-page scan
+        # would be >10 GB and OOM the process — which is the whole reason a tight
+        # file-size cap used to be necessary.
+        ocr = await self._ocr_sparse_pages(
             file_path,
             native_pages,
             settings.pdf_ocr_per_page_min_chars,
             settings.pdf_ocr_render_dpi,
+            settings.pdf_ocr_max_pages,
         )
-        if rendered is None:
+        if ocr is None:
             # PyMuPDF could not open the doc; fall back to whatever native text we had.
             return ExtractionResult(
                 text="\n".join(p for p in native_pages if p),
                 source="native",
             )
 
-        page_images, ocr_indices = rendered
-        ocr_texts: dict[int, str] = {}
-        for idx in ocr_indices:
-            ocr_texts[idx] = await ocr_image(page_images[idx])
-
+        ocr_texts, page_count = ocr
         final_pages: list[str] = []
         used_ocr = False
         used_native = False
-        for i, native in enumerate(native_pages):
+        for i in range(max(len(native_pages), page_count)):
+            native = native_pages[i] if i < len(native_pages) else ""
             if i in ocr_texts:
                 final_pages.append(ocr_texts[i])
                 used_ocr = True
@@ -95,50 +97,88 @@ class PdfExtractor:
                 pages.append("")
         return pages
 
-    @staticmethod
-    def _render_sparse_pages(
+    async def _ocr_sparse_pages(
+        self,
         file_path: str,
         native_pages: list[str],
         per_page_min_chars: int,
         dpi: int,
-    ) -> tuple[list[Any], list[int]] | None:
+        max_pages: int,
+    ) -> tuple[dict[int, str], int] | None:
+        """Render + OCR each text-sparse page one at a time, freeing the page
+        image before moving to the next. Returns ({page_index: ocr_text}, page_count),
+        or None if PyMuPDF can't open the document.
+
+        Only ~one page raster is alive at a time, so peak memory is independent of
+        page count. ``max_pages`` (0 = unlimited) caps how many pages get OCR'd so a
+        pathological multi-thousand-page scan can't pin the CPU indefinitely.
+        """
+        opened = await asyncio.to_thread(self._open_doc, file_path)
+        if opened is None:
+            return None
+        doc, page_count = opened
+
+        try:
+            indices = [
+                i
+                for i in range(page_count)
+                if len((native_pages[i] if i < len(native_pages) else "").strip())
+                < per_page_min_chars
+            ]
+            if max_pages > 0 and len(indices) > max_pages:
+                logger.info(
+                    "Capping OCR at %d of %d sparse pages for %s (pdf_ocr_max_pages)",
+                    max_pages,
+                    len(indices),
+                    file_path,
+                )
+                indices = indices[:max_pages]
+
+            ocr_texts: dict[int, str] = {}
+            for i in indices:
+                img = await asyncio.to_thread(self._render_page, doc, i, dpi, file_path)
+                if img is None:
+                    continue
+                ocr_texts[i] = await ocr_image(img)
+                del img  # release the ~25 MB raster before rendering the next page
+            return ocr_texts, page_count
+        finally:
+            await asyncio.to_thread(self._close_doc, doc)
+
+    @staticmethod
+    def _open_doc(file_path: str) -> tuple[Any, int] | None:
         try:
             import pymupdf
         except ImportError as ex:
             logger.warning("PyMuPDF not available; cannot OCR PDF %s: %s", file_path, ex)
             return None
-
         try:
             doc = pymupdf.open(file_path)
         except Exception as ex:
             logger.warning("PyMuPDF could not open %s: %s", file_path, ex)
             return None
+        return doc, doc.page_count
+
+    @staticmethod
+    def _render_page(doc: Any, i: int, dpi: int, file_path: str) -> Any:
+        import pymupdf
 
         try:
-            page_count = doc.page_count
-            # Use the larger of pypdf's count and PyMuPDF's count to size the list.
-            n = max(page_count, len(native_pages))
-            page_images: list[Any] = [None] * n
-            ocr_indices: list[int] = []
             zoom = dpi / 72.0
             mat = pymupdf.Matrix(zoom, zoom)
-            for i in range(page_count):
-                native_text = native_pages[i] if i < len(native_pages) else ""
-                if len(native_text.strip()) >= per_page_min_chars:
-                    continue
-                try:
-                    page = doc.load_page(i)
-                    pix = page.get_pixmap(matrix=mat, colorspace=pymupdf.csRGB)
-                    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
-                        pix.height, pix.width, pix.n
-                    )
-                    page_images[i] = img.copy()  # detach from pix.samples buffer
-                    ocr_indices.append(i)
-                except Exception as ex:
-                    logger.warning(
-                        "Failed to render page %d of %s for OCR: %s", i, file_path, ex
-                    )
-            return page_images, ocr_indices
-        finally:
-            with contextlib.suppress(Exception):
-                doc.close()
+            page = doc.load_page(i)
+            pix = page.get_pixmap(matrix=mat, colorspace=pymupdf.csRGB)
+            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+                pix.height, pix.width, pix.n
+            )
+            return img.copy()  # detach from pix.samples buffer
+        except Exception as ex:
+            logger.warning(
+                "Failed to render page %d of %s for OCR: %s", i, file_path, ex
+            )
+            return None
+
+    @staticmethod
+    def _close_doc(doc: Any) -> None:
+        with contextlib.suppress(Exception):
+            doc.close()

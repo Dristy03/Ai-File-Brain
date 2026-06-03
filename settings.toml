@@ -23,13 +23,16 @@ max_filename_match_distance = 0.85
 # name_only_extensions below), so this no longer affects images.
 ocr_enabled = true
 ocr_languages = ["en"]
+ocr_use_gpu = true                 # GPU OCR via DirectML; auto-falls back to CPU if unavailable
 pdf_ocr_min_native_chars = 50      # below this total, switch to per-page OCR fallback
 pdf_ocr_per_page_min_chars = 10    # below this on a page, OCR that page
 pdf_ocr_render_dpi = 220
+pdf_ocr_max_pages = 0              # max pages to OCR per PDF (0 = unlimited)
 
-# Hard upper bound on per-file size before indexing. Skips runaway lockfiles,
-# generated bundles, etc. 10 MiB by default.
-max_file_size_bytes = 10485760
+# Backstop against runaway generated junk (lockfiles, bundles, DB dumps), NOT a
+# memory guard: OCR streams page-by-page and text extraction is bounded, so large
+# real documents index fine. 200 MiB by default; set 0 to disable the cap entirely.
+max_file_size_bytes = 209715200
 
 # How many files are indexed (extracted + embedded) at once during bulk scans.
 # Keeps a huge watch root from flooding Ollama / exhausting memory.

@@ -57,7 +57,34 @@ async def _get_engine(settings: AiFileBrainSettings):
 def _init_engine_sync(settings: AiFileBrainSettings):
     from rapidocr_onnxruntime import RapidOCR
 
-    logger.info("Loading RapidOCR (languages=%s)", settings.ocr_languages)
+    if settings.ocr_use_gpu:
+        import onnxruntime as ort
+
+        if "DmlExecutionProvider" in ort.get_available_providers():
+            try:
+                # DirectML for all three OCR models (detect / classify / recognize).
+                engine = RapidOCR(
+                    **{"Det.use_dml": True, "Cls.use_dml": True, "Rec.use_dml": True}
+                )
+                logger.info(
+                    "Loaded RapidOCR with DirectML GPU acceleration (languages=%s)",
+                    settings.ocr_languages,
+                )
+                return engine
+            except Exception as ex:
+                # Runtime present but the GPU couldn't init (driver/busy/OOM). Don't
+                # disable OCR — fall through and load on CPU instead.
+                logger.warning(
+                    "DirectML GPU OCR failed to initialize (%s); falling back to CPU.",
+                    ex,
+                )
+        else:
+            logger.warning(
+                "ocr_use_gpu=True but DmlExecutionProvider is unavailable; "
+                "install onnxruntime-directml to use the GPU. Falling back to CPU."
+            )
+
+    logger.info("Loading RapidOCR on CPU (languages=%s)", settings.ocr_languages)
     return RapidOCR()
 
 
