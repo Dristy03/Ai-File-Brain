@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from collections.abc import AsyncIterator
 
 from ollama import AsyncClient
@@ -17,8 +18,6 @@ from ai_file_brain.core.models import (
     StatusChunk,
     TokenChunk,
 )
-import re
-
 from ai_file_brain.core.storage import VectorRepository, _under_watch_folder
 from ai_file_brain.core.time_intent import (
     RecencyIntent,
@@ -296,11 +295,11 @@ class ChatService:
 
         user_message = _build_user_message(question, hits, window, recency)
         system_prompt = RECENCY_SYSTEM_PROMPT if recency is not None else SYSTEM_PROMPT
-        messages = (
-            [{"role": "system", "content": system_prompt}]
-            + self._history
-            + [{"role": "user", "content": user_message}]
-        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            *self._history,
+            {"role": "user", "content": user_message},
+        ]
 
         yield StatusChunk(message="Thinking…")
 

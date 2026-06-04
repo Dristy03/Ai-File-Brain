@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 class PlainTextExtractor:
     async def extract(self, file_path: str) -> ExtractionResult:
         cap = AiFileBrainSettings().max_extracted_chars
-        async with aiofiles.open(file_path, mode="r", encoding="utf-8", errors="replace") as f:
+        async with aiofiles.open(file_path, encoding="utf-8", errors="replace") as f:
             if cap and cap > 0:
                 # Read one past the cap so we can tell whether truncation happened
                 # without pulling a multi-hundred-MB file fully into memory.

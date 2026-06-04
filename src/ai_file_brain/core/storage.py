@@ -164,6 +164,15 @@ class ChromaVectorRepository:
         await self._meta.upsert_files(chunks)
 
     async def delete_by_path(self, file_path: str) -> None:
+        # The indexer deletes-before-upsert on every file, but during a fresh scan
+        # almost every file is new and has nothing to delete. The Chroma delete is
+        # a metadata scan whose cost grows with collection size (~12x the sidecar
+        # lookup here), so skip it when the sidecar shows the path isn't indexed.
+        # Safe because upsert overwrites chunks by deterministic id; the delete
+        # only matters to clear orphan chunks from a file that previously had more
+        # chunks — which, by definition, was already indexed (so has_path is True).
+        if not await self._meta.has_path(file_path):
+            return
         col = self._require()
         await asyncio.to_thread(col.delete, where={"file_path": file_path})
         await self._meta.delete_by_path(file_path)

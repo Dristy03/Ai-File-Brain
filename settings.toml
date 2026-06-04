@@ -2,7 +2,8 @@
 # Override any value via environment variable: AFB_<UPPERCASE_FIELD>=...
 # Example: AFB_WATCH_FOLDER="D:/notes"
 
-watch_folder = "C:/Users/ASUS/Documents/AIFileBrainTest"
+# Defaults to the current user's Downloads folder (~ is expanded at load time).
+watch_folder = "~/Downloads"
 ollama_url = "http://127.0.0.1:11434"
 chroma_path = "./chroma-data"
 embedding_model = "nomic-embed-text"
@@ -51,7 +52,7 @@ name_only_extensions = [
     # source code — names only for now
     ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".cs", ".go", ".rs",
     ".rb", ".php", ".c", ".cpp", ".cc", ".h", ".hpp", ".sh", ".bash",
-    ".ps1", ".sql",
+    ".sql",
     # images — OCR disabled this phase, so name-only
     ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp", ".gif",
     # extra media / archives, by name

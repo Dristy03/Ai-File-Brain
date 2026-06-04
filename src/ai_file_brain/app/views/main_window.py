@@ -23,7 +23,6 @@ from ai_file_brain.app.models.chat_turn import ChatTurn
 from ai_file_brain.app.view_models.main_window_vm import MainWindowViewModel
 from ai_file_brain.app.view_models.status_bar_vm import StatusBarViewModel
 
-
 PALETTE = {
     "bg": "#f7f9fc",
     "surface": "#ffffff",
@@ -182,6 +181,15 @@ QToolButton#CopyConversationButton:disabled {{
     color: {PALETTE['text_subtle']};
     border-color: {PALETTE['border']};
 }}
+
+QLabel#OllamaBanner {{
+    background-color: #fffaf0;
+    color: #9c4221;
+    border-bottom: 1px solid #f6ad55;
+    padding: 8px 14px;
+    font-size: 12px;
+    font-weight: 500;
+}}
 """
 
 
@@ -307,6 +315,14 @@ class MainWindow(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
+        # ---- connectivity banner (shown only when Ollama is unreachable) ----
+        self._banner = QLabel("")
+        self._banner.setObjectName("OllamaBanner")
+        self._banner.setWordWrap(True)
+        self._banner.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._banner.setVisible(False)
+        outer.addWidget(self._banner)
+
         # ---- transcript ----
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
@@ -392,6 +408,7 @@ class MainWindow(QWidget):
         vm.input_text_changed.connect(self._on_input_text_changed)
         status_vm.changed.connect(self._refresh_status)
         self._input.textChanged.connect(self._sync_input_to_vm)
+        self._refresh_banner()
 
     # ---- public API ----
 
@@ -491,6 +508,30 @@ class MainWindow(QWidget):
     def _refresh_status(self) -> None:
         self._status_label.setText(self._status_vm.render_html())
         self._status_label.setToolTip(self._status_vm.render_tooltip())
+        self._refresh_banner()
+
+    def _refresh_banner(self) -> None:
+        # Only after the first probe, so we don't flash a warning during startup.
+        if not self._status_vm.ollama_checked:
+            self._banner.setVisible(False)
+            return
+        if not self._status_vm.ollama_healthy:
+            self._banner.setText(
+                "⚠  Ollama isn't reachable. Start the Ollama server — indexing and "
+                "answers will resume automatically once it's back."
+            )
+            self._banner.setVisible(True)
+            return
+        missing = self._status_vm.missing_models
+        if missing:
+            pulls = "   ".join(f"ollama pull {m}" for m in missing)
+            self._banner.setText(
+                f"⚠  Required model(s) not installed: {', '.join(missing)}. "
+                f"Run:  {pulls}   — indexing/answers resume automatically once pulled."
+            )
+            self._banner.setVisible(True)
+            return
+        self._banner.setVisible(False)
 
 
 class _EnterToSendTextEdit(QPlainTextEdit):

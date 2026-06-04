@@ -78,4 +78,10 @@ class OllamaEmbeddingService:
             EMBED_MAX_ATTEMPTS,
             len(group),
         )
-        return vecs
+        # Force exactly one entry per input even when Ollama returned *fewer*
+        # items (not just empty ones): callers pair vectors to chunks positionally
+        # with zip(strict=True), so a short list would raise and fail the whole
+        # file instead of letting them skip the empty entries.
+        if len(vecs) < len(group):
+            vecs = vecs + [[] for _ in range(len(group) - len(vecs))]
+        return vecs[: len(group)]

@@ -50,13 +50,16 @@ async def _repo_with_sidecar(tmp_path) -> ChromaVectorRepository:
 
 class _SidecarStubCollection:
     """Absorbs the Chroma side of upsert/delete so sidecar-backed repo methods
-    can be exercised without a real Chroma collection."""
+    can be exercised without a real Chroma collection. Counts delete calls."""
+
+    def __init__(self) -> None:
+        self.delete_calls = 0
 
     def upsert(self, ids, embeddings, documents, metadatas):
         pass
 
     def delete(self, where=None):
-        pass
+        self.delete_calls += 1
 
 
 @pytest.mark.asyncio
@@ -324,3 +327,28 @@ async def test_delete_by_path_removes_from_sidecar(tmp_path):
 
     assert not await repo.has_path(p)
     assert await repo.all_file_paths() == set()
+
+
+@pytest.mark.asyncio
+async def test_delete_by_path_skips_chroma_for_unindexed_path(tmp_path):
+    """A delete for a path the sidecar doesn't know must NOT hit Chroma — that's
+    the wasted per-file cost during a fresh scan of all-new files."""
+    repo = await _repo_with_sidecar(tmp_path)
+    stub = repo._collection
+
+    await repo.delete_by_path(str(Path(repo._settings.watch_folder) / "never_indexed.txt"))
+
+    assert stub.delete_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_by_path_hits_chroma_for_indexed_path(tmp_path):
+    repo = await _repo_with_sidecar(tmp_path)
+    stub = repo._collection
+    now = datetime.now(UTC)
+    p = str(Path(repo._settings.watch_folder) / "real.txt")
+    await repo.upsert_batch([_chunk(p, "real.txt", now)], [[0.1]])
+
+    await repo.delete_by_path(p)
+
+    assert stub.delete_calls == 1

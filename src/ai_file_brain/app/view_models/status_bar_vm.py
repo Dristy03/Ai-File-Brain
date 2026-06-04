@@ -13,6 +13,12 @@ class StatusBarViewModel(QObject):
         self._ollama_healthy = False
         self._chroma_healthy = False
         self._current_activity = ""
+        # False until the first health probe completes, so UI can distinguish
+        # "not checked yet" from "checked and down" (avoids a startup banner flash).
+        self._ollama_checked = False
+        # Required Ollama models (embedding/chat) that aren't installed yet, as
+        # reported by the last probe. Empty when all present or Ollama is down.
+        self._missing_models: tuple[str, ...] = ()
 
     @property
     def watch_folder(self) -> str:
@@ -42,6 +48,27 @@ class StatusBarViewModel(QObject):
     def ollama_healthy(self, v: bool) -> None:
         if v != self._ollama_healthy:
             self._ollama_healthy = v
+            self.changed.emit()
+
+    @property
+    def ollama_checked(self) -> bool:
+        return self._ollama_checked
+
+    @ollama_checked.setter
+    def ollama_checked(self, v: bool) -> None:
+        if v != self._ollama_checked:
+            self._ollama_checked = v
+            self.changed.emit()
+
+    @property
+    def missing_models(self) -> tuple[str, ...]:
+        return self._missing_models
+
+    @missing_models.setter
+    def missing_models(self, v: tuple[str, ...]) -> None:
+        v = tuple(v)
+        if v != self._missing_models:
+            self._missing_models = v
             self.changed.emit()
 
     @property

@@ -58,3 +58,24 @@ async def test_embed_batch_no_retry_when_complete():
 
     assert out == [[0.1, 0.2, 0.3], [0.1, 0.2, 0.3]]
     assert client.calls == 1  # single request, no retries needed
+
+
+class ShortClient:
+    """Always returns FEWER embeddings than inputs — mimics Ollama dropping
+    items rather than returning empty ones."""
+
+    async def embed(self, model, input):
+        return {"embeddings": [[0.1, 0.2, 0.3]]}  # one vector regardless of input count
+
+
+@pytest.mark.asyncio
+async def test_embed_batch_pads_short_response_to_one_per_input():
+    """A short response must still yield one entry per input so callers can pair
+    vectors to chunks positionally (zip strict) instead of crashing the file."""
+    svc = OllamaEmbeddingService(ShortClient(), "m")
+
+    out = await svc.embed_batch(["a", "b", "c"])
+
+    assert len(out) == 3
+    assert out[0] == [0.1, 0.2, 0.3]
+    assert out[1] == [] and out[2] == []  # padded; callers skip empties

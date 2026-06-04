@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from dataclasses import dataclass
 
@@ -88,22 +89,34 @@ def build_container(settings: AiFileBrainSettings, qapp: QApplication, icon: QIc
     status_vm = StatusBarViewModel()
     main_window_vm = MainWindowViewModel(chat)
     main_window = MainWindow(main_window_vm, status_vm)
-    health_check = HealthCheckService(ollama, vector_repo, status_vm, settings)
     activity_service = IndexingActivityService(status_vm)
 
     def _progress(p: IndexingProgress) -> None:
         if p.state == "indexed":
-            try:
+            with contextlib.suppress(Exception):
                 # Optimistic local nudge; the 10s health probe will reconcile.
                 status_vm.chunk_count = status_vm.chunk_count + _maybe_chunk_delta(p.detail)
-            except Exception:
-                pass
         activity_service.on_progress(p)
 
     watcher = FileWatcherService(settings, pipeline, vector_repo, progress=_progress)
     watch_folder_service = WatchFolderService(settings, watcher, status_vm)
+    # When Ollama comes back after being down, re-index files that failed to embed
+    # while it was unreachable (a cold start with Ollama off would otherwise index
+    # nothing until the next restart or file change).
+    health_check = HealthCheckService(
+        ollama, vector_repo, status_vm, settings, on_ollama_recovered=watcher.rescan
+    )
 
     tray_icon_service: TrayIconService | None = None
+    # Anchor fire-and-forget UI tasks: without a live reference the event loop
+    # only holds a weak one, so the GC can cancel a folder-switch or the quit
+    # sequence mid-flight. Discard each task when it finishes.
+    bg_tasks: set[asyncio.Task] = set()
+
+    def _spawn(coro) -> None:
+        task = asyncio.ensure_future(coro)
+        bg_tasks.add(task)
+        task.add_done_callback(bg_tasks.discard)
 
     def _toggle() -> None:
         main_window.toggle_visibility()
@@ -118,7 +131,7 @@ def build_container(settings: AiFileBrainSettings, qapp: QApplication, icon: QIc
         )
         if not chosen:
             return
-        asyncio.ensure_future(_apply_folder_change(chosen))
+        _spawn(_apply_folder_change(chosen))
 
     async def _apply_folder_change(path: str) -> None:
         try:
@@ -133,7 +146,7 @@ def build_container(settings: AiFileBrainSettings, qapp: QApplication, icon: QIc
 
     def _quit() -> None:
         main_window.mark_quitting()
-        asyncio.ensure_future(_graceful_quit(qapp))
+        _spawn(_graceful_quit(qapp))
 
     async def _graceful_quit(app: QApplication) -> None:
         try:

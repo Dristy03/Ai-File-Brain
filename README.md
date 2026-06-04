@@ -16,7 +16,7 @@ A local-first desktop app that watches a folder, indexes your files into a local
     - PowerPoint · `.pptx` (slide text, tables, speaker notes) and legacy `.ppt` (OLE text atoms)
     - Excel · `.xlsx` (`openpyxl`) and legacy `.xls` (`xlrd`) — cell values across every sheet, sheet titles preserved
   - **Filename only** (`name_only_extensions`) — just the file *name* is embedded as a stub so it's findable by name, contents not read:
-    - Source code · `.py .js .ts .tsx .jsx .java .cs .go .rs .rb .php .c .cpp .cc .h .hpp .sh .bash .ps1 .sql`
+    - Source code · `.py .js .ts .tsx .jsx .java .cs .go .rs .rb .php .c .cpp .cc .h .hpp .sh .bash .sql` (`.ps1` is in `excluded_extensions`, so PowerShell scripts are skipped)
     - Images · `.png .jpg .jpeg .tif .tiff .bmp .webp .gif` (image OCR is **off** this phase — name only)
     - Media / archives · `.mp4 .zip`
 - Per-chunk `extraction_source` metadata (`native | ocr | mixed | filename_only`) carried through the vector store; filename-only stubs are excluded from semantic content search
@@ -40,7 +40,7 @@ A local-first desktop app that watches a folder, indexes your files into a local
 - **Two-tier indexing** — `content_extensions` (full text) and `name_only_extensions` (filename stub); anything in neither is skipped entirely
 - **Smart exclusions** — directory-name and extension skip lists, with sensible Windows defaults (`AppData`, `node_modules`, `.git`, `__pycache__`, `.venv`, `dist`, `build`, `.lock`, `.pyc`…); exclusions win over both tiers
 - `max_concurrent_indexing` (4 default) bounds how many files are extracted/embedded at once so a huge watch root can't overwhelm the machine
-- `max_file_size_bytes` cap (10 MiB default) defangs runaway lockfiles and generated bundles
+- `max_file_size_bytes` cap (200 MiB default; `0` disables) defangs runaway lockfiles and generated bundles
 - `ocr_enabled` governs the **scanned-PDF** OCR fallback (image OCR is off this phase — images are name-only)
 - `pdf_ocr_min_native_chars`, `pdf_ocr_per_page_min_chars`, `pdf_ocr_render_dpi` for the PDF OCR fallback
 - All settings overridable via `AFB_*` environment variables
@@ -81,7 +81,7 @@ Notable settings:
 
 | Setting | Default | What it does |
 |---|---|---|
-| `watch_folder` | `C:/Users/ASUS/Documents/AIFileBrainTest` | Folder watched recursively |
+| `watch_folder` | `~/Downloads` | Folder watched recursively (`~` expands to your home) |
 | `chunk_size` / `chunk_overlap` | `2000` / `400` | Character-window chunking |
 | `top_k` | `5` | Number of retrieved chunks fed to the LLM |
 | `content_extensions` | `.txt .md .rst .pdf .docx .pptx .xlsx .doc .ppt .xls` | Extensions whose **content** is extracted, chunked, and embedded |
@@ -91,7 +91,8 @@ Notable settings:
 | `pdf_ocr_min_native_chars` | `50` | Below this total native text, OCR fallback engages |
 | `pdf_ocr_per_page_min_chars` | `10` | Below this on a page (in fallback mode), the page is OCR'd |
 | `pdf_ocr_render_dpi` | `220` | DPI for PDF page rendering before OCR |
-| `max_file_size_bytes` | `10485760` (10 MiB) | Files larger than this are skipped |
+| `max_file_size_bytes` | `209715200` (200 MiB; `0` = unlimited) | Files larger than this are skipped |
+| `max_extracted_chars` | `50000000` (`0` = unlimited) | Caps extracted text chars per file (bounds memory on giant spreadsheets/logs) |
 | `excluded_dir_names` | see `settings.toml` | Path components that mark a file as ignored (wins over both tiers) |
 | `excluded_extensions` | `.lock .pyc .pyo .log .tmp .bak .ps1` | Extensions never indexed (wins over both tiers) |
 

@@ -6,7 +6,7 @@ import os
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from watchdog.events import (
@@ -138,8 +138,8 @@ class IndexingPipeline:
         file_name = os.path.basename(file_path)
         if not file_name:
             return 0
-        modified = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
-        created = datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc)
+        modified = datetime.fromtimestamp(stat.st_mtime, tz=UTC)
+        created = datetime.fromtimestamp(stat.st_ctime, tz=UTC)
 
         # Embed the *meaning* of the filename (extension dropped, separators and
         # camelCase split into words) so a conceptual question can reach this
@@ -208,8 +208,8 @@ class IndexingPipeline:
             return 0
 
         stat = os.stat(file_path)
-        modified = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
-        created = datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc)
+        modified = datetime.fromtimestamp(stat.st_mtime, tz=UTC)
+        created = datetime.fromtimestamp(stat.st_ctime, tz=UTC)
         file_name = os.path.basename(file_path)
 
         await self._repo.delete_by_path(file_path)
@@ -275,6 +275,9 @@ class FileWatcherService:
         self._index_queue: asyncio.Queue[str] | None = None
         self._workers: list[asyncio.Task] = []
         self._concurrency = max(1, settings.max_concurrent_indexing)
+        # Guards rescan() so overlapping triggers (e.g. Ollama health flapping)
+        # don't stack concurrent full scans.
+        self._rescanning = False
         # Precompute the tier sets once; consulted per file during scans/events.
         self._content_exts = frozenset(e.lower() for e in settings.content_extensions)
         self._name_only_exts = frozenset(e.lower() for e in settings.name_only_extensions)
@@ -476,7 +479,7 @@ class FileWatcherService:
         if indexed_mtime is None:
             return True
         try:
-            disk = datetime.fromtimestamp(os.path.getmtime(file_path), tz=timezone.utc)
+            disk = datetime.fromtimestamp(os.path.getmtime(file_path), tz=UTC)
         except OSError:
             # Can't stat it now; let it through and let index_file sort it out.
             return True
@@ -543,6 +546,24 @@ class FileWatcherService:
 
     async def _initial_scan(self) -> None:
         await self._scan_and_index(self._settings.watch_folder)
+
+    async def rescan(self) -> None:
+        """Re-run the folder scan, indexing files that aren't up to date.
+
+        The scan skips files already indexed and unchanged (via ``path_mtimes``),
+        so this is cheap when nothing's wrong. Its purpose is recovery: if Ollama
+        was unreachable during the initial scan, every file failed to embed and so
+        was never indexed — once Ollama is back, this picks them all up. Guarded so
+        health-check flapping can't stack concurrent scans.
+        """
+        if not self._running or self._rescanning:
+            return
+        self._rescanning = True
+        try:
+            logger.info("Rescanning %s", self._settings.watch_folder)
+            await self._scan_and_index(self._settings.watch_folder)
+        finally:
+            self._rescanning = False
 
     async def _reconcile_index(self) -> None:
         """Drop index entries for watched files that no longer exist on disk.

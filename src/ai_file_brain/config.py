@@ -4,6 +4,7 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict, TomlConfigSettingsSource
 
 DEFAULTS_TOML = "settings.toml"
@@ -17,7 +18,10 @@ class AiFileBrainSettings(BaseSettings):
         case_sensitive=False,
     )
 
-    watch_folder: str = r"C:\Users\ASUS\Documents\AIFileBrainTest"
+    # Portable default: the current user's Downloads folder. The validator below
+    # expands the leading ~ so the watcher and path scoping always see an
+    # absolute path, regardless of which machine this runs on.
+    watch_folder: str = "~/Downloads"
     ollama_url: str = "http://127.0.0.1:11434"
     chroma_path: str = "./chroma-data"
     embedding_model: str = "nomic-embed-text"
@@ -100,7 +104,7 @@ class AiFileBrainSettings(BaseSettings):
         # source code — names only for now
         ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".cs", ".go", ".rs",
         ".rb", ".php", ".c", ".cpp", ".cc", ".h", ".hpp", ".sh", ".bash",
-        ".ps1", ".sql",
+        ".sql",
         # images — OCR disabled this phase, so name-only
         ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp", ".gif",
         # extra media / archives, by name
@@ -143,6 +147,17 @@ class AiFileBrainSettings(BaseSettings):
         ".tmp",
         ".bak",
     ]
+
+    @field_validator("watch_folder")
+    @classmethod
+    def _expand_watch_folder(cls, v: str) -> str:
+        # Expand a leading ~ (e.g. the "~/Downloads" default) to the current
+        # user's home so the watcher's mkdir and the under-watch-folder scoping
+        # get an absolute path. Paths without a leading ~ are returned verbatim,
+        # so explicit absolute paths keep their exact form.
+        if v.startswith("~"):
+            return str(Path(v).expanduser())
+        return v
 
     @classmethod
     def settings_customise_sources(
