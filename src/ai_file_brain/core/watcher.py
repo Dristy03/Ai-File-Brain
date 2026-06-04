@@ -6,7 +6,7 @@ import os
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from watchdog.events import (
@@ -42,6 +42,11 @@ RETRY_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
 # blocks (back-pressure) instead of piling millions of paths into memory.
 SCAN_BATCH_SIZE = 200
 INDEX_QUEUE_MAXSIZE = 1000
+
+# A scanned file is considered unchanged (and skipped) when its on-disk mtime is
+# no newer than what we already indexed, allowing this slack for filesystem
+# timestamp resolution (FAT is 2s) and ISO round-trip rounding.
+MTIME_TOLERANCE = timedelta(seconds=2)
 
 
 ProgressCallback = Callable[["IndexingProgress"], None]
@@ -183,7 +188,21 @@ class IndexingPipeline:
             await self._repo.delete_by_path(file_path)
             return 0
 
-        text_chunks = self._chunker.chunk(result.text)
+        # Universal backstop: even extractors that load whole-file (docx, pptx, …)
+        # can't flood chunking/embedding with an unbounded string. The worst
+        # offenders (xlsx, plain text) also stop reading at the cap themselves.
+        text = result.text
+        cap = self._settings.max_extracted_chars
+        if cap and len(text) > cap:
+            logger.info(
+                "Truncating extracted text of %s from %d to %d chars (max_extracted_chars)",
+                file_path,
+                len(text),
+                cap,
+            )
+            text = text[:cap]
+
+        text_chunks = self._chunker.chunk(text)
         if not text_chunks:
             await self._repo.delete_by_path(file_path)
             return 0
@@ -437,25 +456,39 @@ class FileWatcherService:
                 queue.task_done()
 
     async def _enqueue_scanned(self, paths: list[str]) -> None:
-        """Put a batch of scanned paths onto the bounded work queue, skipping
-        ones already indexed. ``queue.put`` blocks when the queue is full, which
-        is what throttles the producer walk."""
+        """Put a batch of scanned paths onto the bounded work queue. Freshness
+        filtering already happened in the producer thread, so this just enqueues.
+        ``queue.put`` blocks when the queue is full, which is what throttles the
+        producer walk."""
         queue = self._index_queue
         if queue is None:
             return
         for file_path in paths:
-            try:
-                if await self._repo.has_path(file_path):
-                    continue
-            except Exception as ex:
-                logger.warning("has_path check failed for %s: %s", file_path, ex)
             await queue.put(file_path)
 
-    def _produce_to_queue(self, root: str) -> None:
+    def _needs_index(self, file_path: str, indexed_mtime: datetime | None) -> bool:
+        """Whether a scanned file should be (re)indexed.
+
+        New files (not in the index) always qualify. An already-indexed file is
+        skipped *unless* its on-disk mtime is newer than what we stored — which
+        catches edits made while the app was closed (the live watcher only sees
+        changes while running, so without this they'd linger as stale chunks)."""
+        if indexed_mtime is None:
+            return True
+        try:
+            disk = datetime.fromtimestamp(os.path.getmtime(file_path), tz=timezone.utc)
+        except OSError:
+            # Can't stat it now; let it through and let index_file sort it out.
+            return True
+        return disk > indexed_mtime + MTIME_TOLERANCE
+
+    def _produce_to_queue(self, root: str, indexed_mtimes: dict[str, datetime]) -> None:
         """Walk ``root`` in a worker thread, pruning excluded subtrees, and ship
-        trackable files to the indexing queue in batches. Runs off the event
-        loop so a giant tree (e.g. C:\\) never blocks the UI; back-pressure from
-        the bounded queue keeps memory flat. Called via ``asyncio.to_thread``."""
+        files that are new or changed to the indexing queue in batches. Runs off
+        the event loop so a giant tree (e.g. C:\\) never blocks the UI; back-
+        pressure from the bounded queue keeps memory flat. The freshness check
+        (and its os.stat calls) happens here in the thread rather than on the
+        loop. Called via ``asyncio.to_thread``."""
         loop = self._loop
         if loop is None:
             return
@@ -467,6 +500,8 @@ class FileWatcherService:
 
         batch: list[str] = []
         for file_path in self._walk_trackable(root):
+            if not self._needs_index(file_path, indexed_mtimes.get(file_path)):
+                continue
             batch.append(file_path)
             if len(batch) >= SCAN_BATCH_SIZE:
                 if not self._running:
@@ -493,8 +528,16 @@ class FileWatcherService:
                     yield file_path
 
     async def _scan_and_index(self, root: str) -> None:
+        # Snapshot what's already indexed (path -> newest mtime) once up front, so
+        # the walk can skip unchanged files in-thread instead of doing one DB
+        # round-trip per file. A failure here just means we (re)index everything.
         try:
-            await asyncio.to_thread(self._produce_to_queue, root)
+            indexed_mtimes = await self._repo.path_mtimes()
+        except Exception as ex:
+            logger.warning("Could not load indexed mtimes for scan of %s: %s", root, ex)
+            indexed_mtimes = {}
+        try:
+            await asyncio.to_thread(self._produce_to_queue, root, indexed_mtimes)
         except OSError as ex:
             logger.warning("Scan of %s failed: %s", root, ex)
 

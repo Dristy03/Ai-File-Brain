@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 
+from ai_file_brain.config import AiFileBrainSettings
 from ai_file_brain.core.extraction.ocr import ocr_image
 from ai_file_brain.core.models import ExtractionResult
 
@@ -18,9 +19,12 @@ class ImageExtractor:
         frames = await asyncio.to_thread(self._load_frames_sync, file_path)
         if not frames:
             return ExtractionResult(text="", source="ocr")
+        # Build settings once and reuse across frames (multi-page TIFFs) instead
+        # of re-parsing settings.toml inside ocr_image for every frame.
+        settings = AiFileBrainSettings()
         page_texts: list[str] = []
         for frame in frames:
-            text = await ocr_image(frame)
+            text = await ocr_image(frame, settings)
             if text.strip():
                 page_texts.append(text)
         return ExtractionResult(text="\n".join(page_texts), source="ocr")

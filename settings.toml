@@ -34,6 +34,10 @@ pdf_ocr_max_pages = 0              # max pages to OCR per PDF (0 = unlimited)
 # real documents index fine. 200 MiB by default; set 0 to disable the cap entirely.
 max_file_size_bytes = 209715200
 
+# Cap on extracted text chars per file (0 = unlimited). Huge default (~50 MB of
+# text) so it only ever trims pathological data dumps, never real documents.
+max_extracted_chars = 50000000
+
 # How many files are indexed (extracted + embedded) at once during bulk scans.
 # Keeps a huge watch root from flooding Ollama / exhausting memory.
 max_concurrent_indexing = 4

@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import re
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from ai_file_brain.config import AiFileBrainSettings
+from ai_file_brain.core.metadata_index import (
+    FileMetadataIndex,
+    _safe_extraction_source,
+    _under_watch_folder,
+    chunks_from_chroma_get,
+)
 from ai_file_brain.core.models import FileChunk, QueryHit
+
+# Re-exported so watcher.py / chat.py keep importing the scoping helper from here.
+__all__ = ["ChromaVectorRepository", "VectorRepository", "_under_watch_folder"]
 
 logger = logging.getLogger(__name__)
 
@@ -28,20 +35,6 @@ _QUERY_OVER_FETCH = 10
 _QUERY_OVER_FETCH_MAX = 200
 
 
-def _under_watch_folder(file_path: str, watch_folder: str) -> bool:
-    """True if ``file_path`` lives under ``watch_folder``.
-
-    Case-insensitive on Windows (via os.path.normcase). An empty/unset
-    watch_folder disables scoping.
-    """
-    if not watch_folder:
-        return True
-    a = os.path.normcase(os.path.normpath(file_path))
-    b = os.path.normcase(os.path.normpath(watch_folder))
-    prefix = b if b.endswith(os.sep) else b + os.sep
-    return a.startswith(prefix)
-
-
 @runtime_checkable
 class VectorRepository(Protocol):
     async def initialize(self) -> None: ...
@@ -52,6 +45,7 @@ class VectorRepository(Protocol):
     async def delete_by_path(self, file_path: str) -> None: ...
     async def delete_under_dir(self, dir_path: str) -> None: ...
     async def all_file_paths(self) -> set[str]: ...
+    async def path_mtimes(self) -> dict[str, datetime]: ...
     async def query(
         self,
         embedding: list[float],
@@ -78,9 +72,37 @@ class ChromaVectorRepository:
         self._settings = settings
         self._client = None
         self._collection = None
+        # SQLite sidecar of per-file metadata, kept beside the Chroma store. It
+        # backs the metadata-only queries (most_recent, filename search, path
+        # listing, mtimes) so they no longer scan every chunk in Chroma.
+        self._meta = FileMetadataIndex(settings.chroma_path_resolved())
 
     async def initialize(self) -> None:
         await asyncio.to_thread(self._init_sync)
+        await self._meta.initialize()
+        await self._backfill_sidecar_if_needed()
+
+    async def _backfill_sidecar_if_needed(self) -> None:
+        """One-time populate of the sidecar from Chroma.
+
+        Handles upgrades from a DB that predates the sidecar (and any case where
+        the sidecar file was deleted): if it's empty but Chroma has chunks, do a
+        single full scan to seed it, then never again. Steady-state writes keep
+        the two in sync from there.
+        """
+        if not await self._meta.is_empty():
+            return
+        chunk_count = await self.count()
+        if chunk_count == 0:
+            return
+        logger.info(
+            "Backfilling metadata sidecar from Chroma (%d chunks)…", chunk_count
+        )
+        col = self._require()
+        result = await asyncio.to_thread(col.get, include=["metadatas", "documents"])
+        chunks = chunks_from_chroma_get(result)
+        await self._meta.upsert_files(chunks)
+        logger.info("Metadata sidecar backfill complete")
 
     def _init_sync(self) -> None:
         import chromadb
@@ -138,10 +160,13 @@ class ChromaVectorRepository:
             documents=documents,
             metadatas=metadatas,
         )
+        # Mirror the per-file representative row into the sidecar.
+        await self._meta.upsert_files(chunks)
 
     async def delete_by_path(self, file_path: str) -> None:
         col = self._require()
         await asyncio.to_thread(col.delete, where={"file_path": file_path})
+        await self._meta.delete_by_path(file_path)
 
     async def delete_under_dir(self, dir_path: str) -> None:
         """Delete every chunk whose file lives under ``dir_path`` (recursive).
@@ -149,17 +174,11 @@ class ChromaVectorRepository:
         Used when a whole directory is removed from, or moved out of, the watch
         tree — watchdog reports that as a single directory event, not one event
         per contained file, so the per-file ``delete_by_path`` never fires for
-        them. Chroma's ``where`` can't do path-prefix matching, so we enumerate
-        distinct paths and delete the matches in one call.
+        them. Chroma's ``where`` can't do path-prefix matching, so we get the
+        victim paths from the sidecar (which holds every distinct path) and
+        delete the matches from both stores in one call each.
         """
-        paths = await self.all_file_paths()
-        norm = os.path.normcase(os.path.normpath(dir_path))
-        prefix = norm if norm.endswith(os.sep) else norm + os.sep
-        victims = [
-            p
-            for p in paths
-            if os.path.normcase(os.path.normpath(p)).startswith(prefix)
-        ]
+        victims = await self._meta.delete_under_dir(dir_path)
         if not victims:
             return
         col = self._require()
@@ -168,22 +187,21 @@ class ChromaVectorRepository:
     async def all_file_paths(self) -> set[str]:
         """Every distinct ``file_path`` currently represented in the index.
 
-        Scans all chunk metadata (O(N) in collection size), so callers should
-        treat it as a maintenance operation, not a hot-path query. Used by the
-        watcher's startup reconcile to find indexed files that no longer exist
-        on disk.
+        Served from the sidecar (one row per file), so this is a cheap indexed
+        read rather than a full Chroma scan. Used by the watcher's startup
+        reconcile to find indexed files that no longer exist on disk.
         """
-        col = self._require()
-        result = await asyncio.to_thread(col.get, include=["metadatas"])
-        metas = result.get("metadatas") or []
-        paths: set[str] = set()
-        for meta in metas:
-            if not meta:
-                continue
-            p = meta.get("file_path")
-            if isinstance(p, str) and p:
-                paths.add(p)
-        return paths
+        return await self._meta.all_file_paths()
+
+    async def path_mtimes(self) -> dict[str, datetime]:
+        """Newest indexed ``modified_at`` per ``file_path``.
+
+        Lets the startup scan skip files that are already indexed *and* unchanged
+        on disk, while still re-indexing anything edited while the app was closed.
+        Served from the sidecar, so it's a cheap read rather than an O(N) scan of
+        every chunk in Chroma.
+        """
+        return await self._meta.path_mtimes()
 
     async def query(
         self,
@@ -261,28 +279,20 @@ class ChromaVectorRepository:
         return scoped[:n]
 
     async def most_recent(self, n: int) -> list[QueryHit]:
-        """Return up to ``n`` chunks, sorted by ``modified_at`` desc, deduped by file_path.
+        """Return up to ``n`` files, newest ``modified_at`` first.
 
-        Used for "what's the latest file I worked on?" — pulls metadata + docs
-        and sorts in Python because Chroma can't ``order by`` metadata. Scans
-        every chunk, so cost is O(N) where N is the collection size. Fine
-        until N gets into the hundreds of thousands.
+        Used for "what's the latest file I worked on?". Served from the sidecar
+        (one row per file, already deduped, ordered by mtime), so it's a cheap
+        indexed read rather than the O(N) scan + Python sort it used to be.
         """
-        if n <= 0:
-            return []
-        col = self._require()
-        result = await asyncio.to_thread(
-            col.get,
-            include=["metadatas", "documents"],
-        )
-        return _sort_dedupe_most_recent(result, n, self._settings.watch_folder)
+        return await self._meta.most_recent(n, self._settings.watch_folder)
 
     async def query_by_filename_substrings(
         self, substrings: list[str], n: int
     ) -> list[QueryHit]:
-        """Return up to ``n`` chunks whose ``file_name`` has a *word* starting
-        with any of the given keywords (case-insensitive). One chunk per matched
-        file, the lowest-index chunk first.
+        """Return up to ``n`` files whose ``file_name`` has a *word* starting
+        with any of the given keywords (case-insensitive). One representative
+        chunk per matched file.
 
         Matching is token-prefix, not raw substring: the filename is split on
         separators and camelCase, and a keyword matches only if some token starts
@@ -292,30 +302,15 @@ class ChromaVectorRepository:
 
         Used for "tell me about <name>" — embeddings can't link a query word
         like "screenshot" to a file whose chunk text doesn't contain it (think
-        OCR'd images), but filename matching reliably surfaces the file.
+        OCR'd images), but filename matching reliably surfaces the file. Served
+        from the sidecar rather than a full Chroma scan.
         """
-        if not substrings or n <= 0:
-            return []
-        needles = [s.lower() for s in substrings if s]
-        if not needles:
-            return []
-        col = self._require()
-        result = await asyncio.to_thread(
-            col.get,
-            include=["metadatas", "documents"],
+        return await self._meta.query_by_filename_substrings(
+            substrings, n, self._settings.watch_folder
         )
-        return _filter_by_filename(result, needles, n, self._settings.watch_folder)
 
     async def has_path(self, file_path: str) -> bool:
-        col = self._require()
-        result = await asyncio.to_thread(
-            col.get,
-            where={"file_path": file_path},
-            limit=1,
-            include=[],
-        )
-        ids = result.get("ids") or []
-        return bool(ids)
+        return await self._meta.has_path(file_path)
 
     async def count(self) -> int:
         col = self._require()
@@ -330,114 +325,6 @@ class ChromaVectorRepository:
         except Exception as ex:
             logger.debug("Chroma heartbeat failed: %s", ex)
             return False
-
-
-_CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
-_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
-
-
-def _filename_tokens(file_name: str) -> list[str]:
-    """Split a filename into lowercase word tokens on separators and camelCase.
-
-    'Microsoft.NET.Native.Runtime' -> ['microsoft','net','native','runtime'];
-    'mcfcoreinstaller.zip' -> ['mcfcoreinstaller','zip']. Powers token-prefix
-    filename matching: 'time' won't match inside 'runtime', but 'mcf' still
-    matches the start of 'mcfcoreinstaller'.
-    """
-    spaced = _CAMEL_BOUNDARY_RE.sub(" ", file_name).lower()
-    return [t for t in _NON_ALNUM_RE.split(spaced) if t]
-
-
-def _filter_by_filename(
-    result: dict, needles: list[str], n: int, watch_folder: str
-) -> list[QueryHit]:
-    ids = result.get("ids") or []
-    documents = result.get("documents") or [""] * len(ids)
-    metadatas = result.get("metadatas") or [{}] * len(ids)
-
-    # Pick the lowest-chunk-index match per file so we get the start of the file,
-    # not an arbitrary chunk somewhere inside.
-    best_per_path: dict[str, tuple[int, QueryHit]] = {}
-    for i, chunk_id in enumerate(ids):
-        meta = metadatas[i] or {}
-        file_name = str(meta.get("file_name", ""))
-        file_path = str(meta.get("file_path", ""))
-        if not file_name or not file_path:
-            continue
-        if not _under_watch_folder(file_path, watch_folder):
-            continue
-        tokens = _filename_tokens(file_name)
-        if not any(tok.startswith(needle) for tok in tokens for needle in needles):
-            continue
-        chunk_index = int(meta.get("chunk_index", 0) or 0)
-        existing = best_per_path.get(file_path)
-        if existing is not None and existing[0] <= chunk_index:
-            continue
-        modified_iso = meta.get("modified_at")
-        modified_at = None
-        if isinstance(modified_iso, str):
-            try:
-                modified_at = datetime.fromisoformat(modified_iso)
-            except ValueError:
-                modified_at = None
-        hit = QueryHit(
-            chunk_id=chunk_id,
-            file_path=file_path,
-            file_name=file_name,
-            chunk_index=chunk_index,
-            text=documents[i] or "",
-            distance=0.0,
-            modified_at=modified_at,
-            extraction_source=_safe_extraction_source(meta.get("extraction_source")),
-        )
-        best_per_path[file_path] = (chunk_index, hit)
-
-    return [hit for _index, hit in best_per_path.values()][:n]
-
-
-def _sort_dedupe_most_recent(
-    result: dict, n: int, watch_folder: str
-) -> list[QueryHit]:
-    ids = result.get("ids") or []
-    documents = result.get("documents") or [""] * len(ids)
-    metadatas = result.get("metadatas") or [{}] * len(ids)
-
-    items: list[tuple[datetime, str, QueryHit]] = []
-    for i, chunk_id in enumerate(ids):
-        meta = metadatas[i] or {}
-        modified_iso = meta.get("modified_at")
-        if not isinstance(modified_iso, str):
-            continue
-        try:
-            modified_at = datetime.fromisoformat(modified_iso)
-        except ValueError:
-            continue
-        file_path = str(meta.get("file_path", ""))
-        if not _under_watch_folder(file_path, watch_folder):
-            continue
-        hit = QueryHit(
-            chunk_id=chunk_id,
-            file_path=file_path,
-            file_name=str(meta.get("file_name", "")),
-            chunk_index=int(meta.get("chunk_index", 0) or 0),
-            text=documents[i] or "",
-            distance=0.0,
-            modified_at=modified_at,
-            extraction_source=_safe_extraction_source(meta.get("extraction_source")),
-        )
-        items.append((modified_at, file_path, hit))
-
-    items.sort(key=lambda x: x[0], reverse=True)
-    seen: set[str] = set()
-    hits: list[QueryHit] = []
-    for _modified, file_path, hit in items:
-        if file_path in seen:
-            continue
-        seen.add(file_path)
-        hits.append(hit)
-        if len(hits) >= n:
-            break
-    return hits
 
 
 def _result_to_hits(result: dict) -> list[QueryHit]:
@@ -472,11 +359,3 @@ def _result_to_hits(result: dict) -> list[QueryHit]:
             )
         )
     return hits
-
-
-def _safe_extraction_source(raw):
-    """Coerce a metadata value to a valid ExtractionSource, defaulting to native
-    for old chunks that predate the field or for any unrecognized value."""
-    if raw in ("native", "ocr", "mixed", "filename_only"):
-        return raw
-    return "native"

@@ -15,15 +15,22 @@ _engine_failed: bool = False
 _engine_lock: asyncio.Lock | None = None
 
 
-async def ocr_image(img: np.ndarray) -> str:
+async def ocr_image(
+    img: np.ndarray, settings: AiFileBrainSettings | None = None
+) -> str:
     """Run OCR on a numpy image array. Returns recognised text joined by newlines.
 
     Returns empty string when OCR is disabled, the engine fails to load, or no
     text is recognised. Never raises.
+
+    ``settings`` may be passed in by callers that already built one (e.g. the PDF
+    extractor, which OCRs many pages per file) to avoid re-parsing settings.toml
+    on every page; it's constructed on demand when omitted.
     """
     if img is None or getattr(img, "size", 0) == 0:
         return ""
-    settings = AiFileBrainSettings()
+    if settings is None:
+        settings = AiFileBrainSettings()
     if not settings.ocr_enabled:
         return ""
     engine = await _get_engine(settings)

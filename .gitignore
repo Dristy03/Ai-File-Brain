@@ -26,6 +26,9 @@ chroma-data/
 user-settings.toml
 *.log
 
+# Manual test fixtures (one sample per supported file type)
+sample-files/
+
 # IDE
 .vscode/
 .idea/

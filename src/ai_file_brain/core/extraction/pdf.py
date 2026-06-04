@@ -45,6 +45,7 @@ class PdfExtractor:
             settings.pdf_ocr_per_page_min_chars,
             settings.pdf_ocr_render_dpi,
             settings.pdf_ocr_max_pages,
+            settings,
         )
         if ocr is None:
             # PyMuPDF could not open the doc; fall back to whatever native text we had.
@@ -104,6 +105,7 @@ class PdfExtractor:
         per_page_min_chars: int,
         dpi: int,
         max_pages: int,
+        settings: AiFileBrainSettings,
     ) -> tuple[dict[int, str], int] | None:
         """Render + OCR each text-sparse page one at a time, freeing the page
         image before moving to the next. Returns ({page_index: ocr_text}, page_count),
@@ -139,7 +141,7 @@ class PdfExtractor:
                 img = await asyncio.to_thread(self._render_page, doc, i, dpi, file_path)
                 if img is None:
                     continue
-                ocr_texts[i] = await ocr_image(img)
+                ocr_texts[i] = await ocr_image(img, settings)
                 del img  # release the ~25 MB raster before rendering the next page
             return ocr_texts, page_count
         finally:

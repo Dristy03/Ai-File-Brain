@@ -60,6 +60,14 @@ class AiFileBrainSettings(BaseSettings):
     # documents are fine. 200 MiB by default; set 0 to disable the cap entirely.
     max_file_size_bytes: int = 200 * 1024 * 1024
 
+    # Upper bound on extracted text characters per file (0 = unlimited). Bounds
+    # peak memory + embedding work when a file's *text* dwarfs its on-disk size —
+    # chiefly a spreadsheet flattened to text or a giant log/JSON. The default is
+    # deliberately huge (~50 MB of text: a 5,000+ page book) so it never touches a
+    # real document, only pathological data dumps. The worst offenders (xlsx,
+    # plain text) stop reading at the cap; other types are truncated post-extract.
+    max_extracted_chars: int = 50_000_000
+
     # Upper bound on how many files are indexed (extracted + embedded) at once.
     # Bulk scans feed a bounded work queue drained by this many workers, so a
     # huge watch root (e.g. C:\) can't spawn millions of concurrent tasks and

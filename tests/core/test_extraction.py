@@ -248,6 +248,41 @@ async def test_xlsx_extractor_handles_corrupt_file(tmp_path: Path):
     assert result.source == "native"
 
 
+# --- max_extracted_chars caps ---
+
+
+@pytest.mark.asyncio
+async def test_plain_text_extractor_truncates_at_cap(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("AFB_MAX_EXTRACTED_CHARS", "10")
+    file = tmp_path / "big.txt"
+    file.write_text("0123456789ABCDEFGHIJ", encoding="utf-8")  # 20 chars
+    result = await get_extractor(str(file)).extract(str(file))
+    assert result.text == "0123456789"  # first 10 only
+
+
+@pytest.mark.asyncio
+async def test_plain_text_extractor_unlimited_when_cap_zero(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("AFB_MAX_EXTRACTED_CHARS", "0")
+    file = tmp_path / "full.txt"
+    file.write_text("0123456789ABCDEFGHIJ", encoding="utf-8")
+    result = await get_extractor(str(file)).extract(str(file))
+    assert result.text == "0123456789ABCDEFGHIJ"
+
+
+@pytest.mark.asyncio
+async def test_xlsx_extractor_stops_at_cap(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("AFB_MAX_EXTRACTED_CHARS", "20")
+    path = tmp_path / "wide.xlsx"
+    # Each row contributes well over 20 chars; only the first should survive.
+    _make_xlsx(
+        path,
+        {"Data": [["first_row_value_long"], ["second_row_should_be_dropped"]]},
+    )
+    result = await get_extractor(str(path)).extract(str(path))
+    assert "first_row_value_long" in result.text
+    assert "second_row_should_be_dropped" not in result.text
+
+
 # --- legacy .xls (xlrd) ---
 
 
