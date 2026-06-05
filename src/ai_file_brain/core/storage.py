@@ -34,6 +34,9 @@ _NOT_FILENAME_ONLY_CLAUSE = {"extraction_source": {"$ne": "filename_only"}}
 _QUERY_OVER_FETCH = 10
 _QUERY_OVER_FETCH_MAX = 200
 
+# Chunks updated per Chroma call during the one-time modified_at_ts backfill.
+_BACKFILL_BATCH = 1000
+
 
 @runtime_checkable
 class VectorRepository(Protocol):
@@ -81,6 +84,7 @@ class ChromaVectorRepository:
         await asyncio.to_thread(self._init_sync)
         await self._meta.initialize()
         await self._backfill_sidecar_if_needed()
+        await self._backfill_modified_ts_if_needed()
 
     async def _backfill_sidecar_if_needed(self) -> None:
         """One-time populate of the sidecar from Chroma.
@@ -103,6 +107,58 @@ class ChromaVectorRepository:
         chunks = chunks_from_chroma_get(result)
         await self._meta.upsert_files(chunks)
         logger.info("Metadata sidecar backfill complete")
+
+    async def _backfill_modified_ts_if_needed(self) -> None:
+        """One-time populate of the numeric ``modified_at_ts`` metadata.
+
+        Chunks indexed before this field existed carry only the ISO-string
+        ``modified_at``, which Chroma's numeric range operators ($gte/$lt)
+        reject — so time-window queries ("what did I work on yesterday?") error
+        out until those chunks are migrated. Seed the numeric mirror from the
+        existing string once so they work without a full re-index. Steady-state
+        upserts write both fields, so this no-ops after the first run.
+
+        The cheap gate is a numeric ``$gte`` count: timestamps are positive, so
+        chunks already carrying the field match ``{"modified_at_ts": {"$gte": 0}}``.
+        When that count equals the collection size, everything is migrated.
+        """
+        col = self._require()
+        total = await self.count()
+        if total == 0:
+            return
+        have = await asyncio.to_thread(
+            col.get, where={"modified_at_ts": {"$gte": 0.0}}, include=[]
+        )
+        if len(have.get("ids") or []) >= total:
+            return
+        logger.info("Backfilling numeric modified_at_ts metadata…")
+        result = await asyncio.to_thread(col.get, include=["metadatas"])
+        ids = result.get("ids") or []
+        metas = result.get("metadatas") or []
+        upd_ids: list[str] = []
+        upd_metas: list[dict] = []
+        for chunk_id, meta in zip(ids, metas):
+            meta = dict(meta or {})
+            if meta.get("modified_at_ts") is not None:
+                continue
+            ts = _iso_to_timestamp(meta.get("modified_at"))
+            if ts is None:
+                continue
+            # Rewrite the full metadata dict (existing keys + the new numeric
+            # field) so the update is correct regardless of whether Chroma's
+            # update merges or replaces metadata.
+            meta["modified_at_ts"] = ts
+            upd_ids.append(chunk_id)
+            upd_metas.append(meta)
+        for i in range(0, len(upd_ids), _BACKFILL_BATCH):
+            await asyncio.to_thread(
+                col.update,
+                ids=upd_ids[i : i + _BACKFILL_BATCH],
+                metadatas=upd_metas[i : i + _BACKFILL_BATCH],
+            )
+        logger.info(
+            "modified_at_ts backfill complete (%d of %d chunks)", len(upd_ids), total
+        )
 
     def _init_sync(self) -> None:
         import chromadb
@@ -148,6 +204,10 @@ class ChromaVectorRepository:
                 "chunk_index": c.chunk_index,
                 "created_at": c.created_at.isoformat(),
                 "modified_at": c.modified_at.isoformat(),
+                # Numeric mirror of modified_at: Chroma's range operators
+                # ($gte/$lt) require an int/float operand and reject the ISO
+                # string, so time-window queries filter on this instead.
+                "modified_at_ts": c.modified_at.timestamp(),
                 "extraction_source": c.extraction_source,
             }
             for c in chunks
@@ -222,10 +282,10 @@ class ChromaVectorRepository:
         where_clauses: list[dict] = [_NOT_FILENAME_ONLY_CLAUSE]
         if modified_at_range is not None:
             start, end = modified_at_range
-            # ISO 8601 strings sort lexicographically by date, so $gte/$lte
-            # work directly on the stored "modified_at" string metadata.
-            where_clauses.append({"modified_at": {"$gte": start.isoformat()}})
-            where_clauses.append({"modified_at": {"$lt": end.isoformat()}})
+            # Chroma's $gte/$lt require a numeric operand, so filter on the
+            # numeric "modified_at_ts" mirror rather than the ISO string.
+            where_clauses.append({"modified_at_ts": {"$gte": start.timestamp()}})
+            where_clauses.append({"modified_at_ts": {"$lt": end.timestamp()}})
         fetch_n = min(top_k * _QUERY_OVER_FETCH, _QUERY_OVER_FETCH_MAX)
         kwargs: dict = {
             "query_embeddings": [embedding],
@@ -267,8 +327,8 @@ class ChromaVectorRepository:
         where_clauses: list[dict] = [{"extraction_source": "filename_only"}]
         if modified_at_range is not None:
             start, end = modified_at_range
-            where_clauses.append({"modified_at": {"$gte": start.isoformat()}})
-            where_clauses.append({"modified_at": {"$lt": end.isoformat()}})
+            where_clauses.append({"modified_at_ts": {"$gte": start.timestamp()}})
+            where_clauses.append({"modified_at_ts": {"$lt": end.timestamp()}})
         fetch_n = min(n * _QUERY_OVER_FETCH, _QUERY_OVER_FETCH_MAX)
         where = where_clauses[0] if len(where_clauses) == 1 else {"$and": where_clauses}
         result = await asyncio.to_thread(
@@ -334,6 +394,17 @@ class ChromaVectorRepository:
         except Exception as ex:
             logger.debug("Chroma heartbeat failed: %s", ex)
             return False
+
+
+def _iso_to_timestamp(iso) -> float | None:
+    """POSIX timestamp for a stored ISO ``modified_at`` string, or ``None`` if
+    it's missing/unparseable. Used by the one-time numeric-field backfill."""
+    if not isinstance(iso, str):
+        return None
+    try:
+        return datetime.fromisoformat(iso).timestamp()
+    except ValueError:
+        return None
 
 
 def _result_to_hits(result: dict) -> list[QueryHit]:

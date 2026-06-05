@@ -142,6 +142,43 @@ async def test_query_filename_only_with_time_window_ands_clauses():
 
 
 @pytest.mark.asyncio
+async def test_upsert_writes_numeric_modified_at_ts():
+    """The time-window filter needs a numeric field; Chroma rejects the ISO
+    string for $gte/$lt. Upsert must mirror modified_at into modified_at_ts."""
+    repo = ChromaVectorRepository(AiFileBrainSettings())
+    stub = _StubCollection()
+    repo._collection = stub
+    await repo._meta.initialize()
+
+    modified = datetime(2026, 6, 4, 9, 30, tzinfo=UTC)
+    await repo.upsert_batch([_chunk("/p/x.txt", "x.txt", modified)], [[0.1]])
+
+    assert stub.last_metadatas is not None
+    ts = stub.last_metadatas[0]["modified_at_ts"]
+    assert isinstance(ts, float)
+    assert ts == modified.timestamp()
+
+
+@pytest.mark.asyncio
+async def test_query_time_window_filters_on_numeric_ts():
+    """The range clauses must target modified_at_ts with numeric bounds, not the
+    ISO string (which Chroma's $gte/$lt reject)."""
+    repo = ChromaVectorRepository(AiFileBrainSettings())
+    stub = _StubCollection()
+    repo._collection = stub
+
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    end = datetime(2026, 2, 1, tzinfo=UTC)
+    await repo.query([0.1, 0.2, 0.3], top_k=5, modified_at_range=(start, end))
+
+    clauses = stub.last_query_where["$and"]
+    assert {"modified_at_ts": {"$gte": start.timestamp()}} in clauses
+    assert {"modified_at_ts": {"$lt": end.timestamp()}} in clauses
+    # The old string filter must be gone entirely.
+    assert not any("modified_at" in c and "modified_at_ts" not in c for c in clauses)
+
+
+@pytest.mark.asyncio
 async def test_query_with_time_window_still_excludes_filename_only():
     repo = ChromaVectorRepository(AiFileBrainSettings())
     stub = _StubCollection()
@@ -170,6 +207,77 @@ async def test_filechunk_default_extraction_source_is_native():
         modified_at=now,
     )
     assert chunk.extraction_source == "native"
+
+
+class _BackfillStubCollection:
+    """In-memory Chroma stand-in for the modified_at_ts backfill: holds records
+    as {id: metadata}, and supports count/get(where,include)/update."""
+
+    def __init__(self, records: dict[str, dict]) -> None:
+        self.records = records
+        self.update_calls = 0
+
+    def count(self) -> int:
+        return len(self.records)
+
+    def get(self, include=None, where=None, limit=None):
+        ids = list(self.records)
+        if where is not None and "modified_at_ts" in where:
+            # Mimic Chroma: only records that actually carry the numeric field
+            # match a numeric $gte filter.
+            ids = [i for i in ids if self.records[i].get("modified_at_ts") is not None]
+        out = {"ids": ids}
+        if include and "metadatas" in include:
+            out["metadatas"] = [dict(self.records[i]) for i in ids]
+        return out
+
+    def update(self, ids, metadatas):
+        self.update_calls += 1
+        for chunk_id, meta in zip(ids, metadatas):
+            self.records[chunk_id] = dict(meta)
+
+
+@pytest.mark.asyncio
+async def test_backfill_populates_missing_modified_at_ts(tmp_path):
+    """Chunks indexed before the numeric field existed get it seeded from their
+    ISO modified_at, without a re-index."""
+    settings = AiFileBrainSettings()
+    settings.chroma_path = str(tmp_path / "db")
+    repo = ChromaVectorRepository(settings)
+    iso = "2026-06-04T09:30:00+00:00"
+    stub = _BackfillStubCollection(
+        {
+            "a": {"file_path": "/p/a.txt", "modified_at": iso},
+            "b": {"file_path": "/p/b.txt", "modified_at": iso, "modified_at_ts": 1.0},
+            "c": {"file_path": "/p/c.txt", "modified_at": "not-a-date"},
+        }
+    )
+    repo._collection = stub
+
+    await repo._backfill_modified_ts_if_needed()
+
+    # 'a' gets the parsed timestamp; existing 'b' is left untouched; 'c' is
+    # skipped (unparseable) but keeps its other metadata.
+    assert stub.records["a"]["modified_at_ts"] == datetime.fromisoformat(iso).timestamp()
+    assert stub.records["a"]["file_path"] == "/p/a.txt"  # other keys preserved
+    assert stub.records["b"]["modified_at_ts"] == 1.0
+    assert "modified_at_ts" not in stub.records["c"]
+
+
+@pytest.mark.asyncio
+async def test_backfill_noops_when_all_present(tmp_path):
+    """Steady state: every chunk already has the field, so no update is issued."""
+    settings = AiFileBrainSettings()
+    settings.chroma_path = str(tmp_path / "db")
+    repo = ChromaVectorRepository(settings)
+    stub = _BackfillStubCollection(
+        {"a": {"file_path": "/p/a.txt", "modified_at": "x", "modified_at_ts": 1.0}}
+    )
+    repo._collection = stub
+
+    await repo._backfill_modified_ts_if_needed()
+
+    assert stub.update_calls == 0
 
 
 class _ScopingStubCollection:
