@@ -41,7 +41,7 @@ max_extracted_chars = 50000000
 
 # How many files are indexed (extracted + embedded) at once during bulk scans.
 # Keeps a huge watch root from flooding Ollama / exhausting memory.
-max_concurrent_indexing = 4
+max_concurrent_indexing = 8
 
 # --- What gets indexed, in two tiers; anything in neither list is ignored. ---
 # Tier 1 — full content extracted, chunked and embedded (needs an extractor).
