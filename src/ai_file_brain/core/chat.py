@@ -83,17 +83,12 @@ SYSTEM_PROMPT = (
     "give the filename, but do not invent any contents or summary for them."
 )
 
-# Recency questions are answered from the file *metadata* (filename + modified
-# date), not the chunk text. Demand a strict format so small models (llama3.2)
-# don't hallucinate framing like "multiple timestamps".
-RECENCY_SYSTEM_PROMPT = (
-    "You are a helpful assistant. The user is asking which files are the most "
-    "recently modified. The list below is already sorted newest first; the first "
-    "entry is the most recent. Output ONLY a numbered list, one line per file, in "
-    "the exact format: '<N>. <file name> — <modified-at>'. Do not add commentary, "
-    "qualifiers, or sentences before or after the list. Use the list verbatim — do "
-    "not invent extra timestamps or merge entries."
-)
+# Recency questions are answered entirely from file *metadata* (filename +
+# modified date), which the sidecar already returns sorted newest-first. There's
+# nothing for the LLM to reason about here, and handing the list to a small model
+# (llama3.2) to retype only invites corruption — it has truncated paths and
+# paired the wrong timestamps. So we format the answer deterministically in
+# Python (see _format_recency_answer) and skip the model round-trip entirely.
 
 
 # Cap on prior turns kept for the LLM (each turn is two messages: user + assistant).
@@ -281,6 +276,21 @@ class ChatService:
                 seen_paths.append(hit.file_path)
         yield SourcesChunk(paths=tuple(seen_paths))
 
+        # Recency answers are pure metadata, already sorted — format them in
+        # code and skip the LLM, which can only corrupt a list it has no need to
+        # reason about. Still recorded in history so follow-ups ("the second
+        # one") resolve against it.
+        if recency is not None:
+            answer = _format_recency_answer(hits)
+            yield TokenChunk(text=answer)
+            user_message = _build_user_message(question, hits, window, recency)
+            self._history.append({"role": "user", "content": user_message})
+            self._history.append({"role": "assistant", "content": answer})
+            max_messages = MAX_HISTORY_TURNS * 2
+            if len(self._history) > max_messages:
+                self._history = self._history[-max_messages:]
+            return
+
         unique_names: list[str] = []
         for hit in hits:
             if hit.file_name and hit.file_name not in unique_names:
@@ -293,10 +303,11 @@ class ChatService:
                 message=f"Reading {len(unique_names)} file(s): {preview}"
             )
 
+        # Recency is handled above (returns early), so only the content/window
+        # path reaches here.
         user_message = _build_user_message(question, hits, window, recency)
-        system_prompt = RECENCY_SYSTEM_PROMPT if recency is not None else SYSTEM_PROMPT
         messages = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": SYSTEM_PROMPT},
             *self._history,
             {"role": "user", "content": user_message},
         ]
@@ -329,6 +340,26 @@ class ChatService:
             max_messages = MAX_HISTORY_TURNS * 2
             if len(self._history) > max_messages:
                 self._history = self._history[-max_messages:]
+
+
+def _format_recency_answer(hits: list[QueryHit]) -> str:
+    """Render the recency answer directly from metadata, newest first.
+
+    ``hits`` arrive already sorted newest-first from the sidecar. We format the
+    numbered list ourselves rather than asking the LLM to echo it, because the
+    answer is fully determined by metadata and a small model only introduces
+    errors (wrong timestamps, truncated paths). Modified times are shown in the
+    user's local timezone for readability.
+    """
+    lines: list[str] = []
+    for i, hit in enumerate(hits, start=1):
+        if hit.modified_at is not None:
+            # Stored UTC; show local wall-clock time the user recognises.
+            modified = hit.modified_at.astimezone().strftime("%Y-%m-%d %H:%M")
+        else:
+            modified = "unknown"
+        lines.append(f"{i}. {hit.file_name} — {modified}")
+    return "\n".join(lines)
 
 
 def _merge_unique(groups: list[list[QueryHit]], limit: int) -> list[QueryHit]:

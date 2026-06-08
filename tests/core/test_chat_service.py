@@ -259,18 +259,25 @@ async def test_recency_no_hits_returns_helpful_message():
 
 
 @pytest.mark.asyncio
-async def test_recency_branch_uses_relaxed_system_prompt():
-    recent = [QueryHit("1", "/x.txt", "x.txt", 0, "x", 0.0, datetime(2026, 5, 10, tzinfo=UTC))]
+async def test_recency_answer_is_deterministic_and_skips_llm():
+    # Sidecar returns newest-first; the service must format the list itself
+    # rather than handing it to the LLM, which only corrupts a metadata echo.
+    recent = [
+        QueryHit("1", "/new.txt", "new.txt", 0, "x", 0.0, datetime(2026, 5, 10, tzinfo=UTC)),
+        QueryHit("2", "/old.txt", "old.txt", 0, "y", 0.0, datetime(2026, 5, 1, tzinfo=UTC)),
+    ]
     repo = FakeRepo(hits=[], recent_hits=recent)
-    ollama = FakeOllama(["ok"])
+    ollama = FakeOllama(["should-not-be-used"])
     chat = ChatService(_settings(), FakeEmbedder(), repo, ollama)
-    await chat.ask("what is the latest file I worked on?")
-    assert ollama.last_kwargs is not None
-    system_msg = ollama.last_kwargs["messages"][0]
-    assert system_msg["role"] == "system"
-    # Relaxed prompt that lets the model answer from filename + date metadata.
-    assert "modified" in system_msg["content"].lower()
-    assert "newest first" in system_msg["content"].lower()
+    result = await chat.ask("what is the latest file I worked on?")
+
+    # The LLM must not be invoked for a recency question.
+    assert ollama.last_kwargs is None
+    # Answer is the numbered, newest-first list built from metadata.
+    assert "1. new.txt" in result.answer
+    assert "2. old.txt" in result.answer
+    assert result.answer.index("new.txt") < result.answer.index("old.txt")
+    assert result.sources == ("/new.txt", "/old.txt")
 
 
 @pytest.mark.asyncio

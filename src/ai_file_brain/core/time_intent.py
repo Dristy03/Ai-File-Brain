@@ -40,6 +40,13 @@ _RECENCY_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"\blatest\b", "latest"),
     (r"\bnewest\b", "newest"),
     (r"\blast\s+(?:file|files|thing|things|one|ones)\b", "latest"),
+    # Catch-all for a trailing / bare "recently" — natural phrasing puts the
+    # adverb after the verb ("what have I worked on recently?", "what did I do
+    # recently?"), which the verb-first pattern above misses. "recently" in a
+    # file-search context reliably means "sort by modified_at desc", so treat a
+    # bare occurrence as recency intent. Kept last so the more specific patterns
+    # claim their better labels first.
+    (r"\brecently\b", "most recent"),
 )
 
 
