@@ -68,6 +68,33 @@ def _filename_keywords(question: str) -> list[str]:
     tokens = re.findall(r"[A-Za-z][A-Za-z0-9_-]+", question.lower())
     return [t for t in tokens if len(t) >= 3 and t not in _STOPWORDS]
 
+
+# A "file discovery" question asks WHICH files exist about a topic ("is there
+# any file on X?", "do I have files about Y?", "which files mention Z?") — the
+# user wants a list of files, not a fact pulled from inside them. The relevant
+# answer is fully determined by retrieval (the hits ARE the answer), so the chat
+# layer formats it deterministically and skips the LLM. Content questions ("when
+# does the second half start?") don't match these patterns and still go to the
+# model. Patterns require a file/document head-noun in an existence/listing
+# frame, which is what separates discovery from a content question that merely
+# happens to mention "file".
+_FILE_NOUN = r"(?:file|files|document|documents|doc|docs)"
+_DISCOVERY_PATTERNS: tuple[str, ...] = (
+    rf"\b(?:is|are)\s+there\s+(?:a|an|any|some\s+)?\s*{_FILE_NOUN}\b",
+    rf"\b(?:do|does|did)\s+(?:i|we|you)\s+have\s+(?:a|an|any|some\s+)?\s*{_FILE_NOUN}\b",
+    rf"\b(?:any|which|what)\s+{_FILE_NOUN}\b",
+    rf"\b(?:list|show|find|give)\s+(?:me\s+)?(?:all\s+|the\s+|any\s+)?{_FILE_NOUN}\b",
+)
+
+
+def _is_discovery_question(question: str) -> bool:
+    """True when the question asks *which files* exist on a topic (a request for
+    a file list), as opposed to asking for a fact from inside a file."""
+    if not question:
+        return False
+    q = question.lower()
+    return any(re.search(p, q) for p in _DISCOVERY_PATTERNS)
+
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
@@ -77,6 +104,25 @@ SYSTEM_PROMPT = (
     "to things from prior turns (e.g. 'the third one', 'that file') — resolve such "
     "references using the conversation so far. If the answer is in neither the new "
     "excerpts nor the prior conversation, say so.\n"
+    "\n"
+    "FILENAME RULES — follow these exactly:\n"
+    "1. The ONLY real files are the ones given to you under a `File \"<name>\"` "
+    "label (or filenames established earlier in this conversation). Refer to a file "
+    "by writing its name in plain prose, e.g. According to \"Attendence.docx\", … . "
+    "Do NOT copy the `File \"…\" (modified …):` label lines into your answer.\n"
+    "2. NEVER invent, guess, rename, or 'tidy up' a filename. If a topic, title, or "
+    "project name appears INSIDE a file's contents, that is NOT a filename and does "
+    "NOT mean a file by that name exists. Attribute the information to the real file "
+    "whose excerpt contains it.\n"
+    "   Example: the only file provided is \"Meeting Notes.pptx\" and its text "
+    "mentions an 'AI POC Idea'. If the user asks whether there is a file about the "
+    "AI POC idea, the correct answer is that \"Meeting Notes.pptx\" mentions it. It "
+    "is WRONG to claim there is a file named 'AI POC Idea.pptx' — no such file "
+    "exists.\n"
+    "3. When asked whether a file on some topic exists, only answer yes if one of "
+    "the provided file names matches; otherwise say no such file was found (you may "
+    "still note which file *mentions* the topic, if any).\n"
+    "\n"
     "Some entries are marked 'filename only' — those files exist on the user's "
     "machine but their contents are not indexed (typically archives, executables, "
     "media, or other binaries). For those, acknowledge that the file exists and "
@@ -112,12 +158,18 @@ class ChatService:
         # Replaying the full prior user message (with file chunks) lets follow-up
         # questions like "tell me about <file from previous answer>" work.
         self._history: list[dict[str, str]] = []
+        # file_name -> file_path for every real file surfaced so far this
+        # conversation. Used to attribute the *sources* line to the files the
+        # answer actually cites — including files that were retrieved on an
+        # earlier turn and re-referenced from history rather than re-retrieved.
+        self._known_files: dict[str, str] = {}
         # Background fire-and-forget tasks that purge stale index entries spotted
         # at query time. Kept referenced so they aren't garbage-collected mid-run.
         self._purge_tasks: set[asyncio.Task] = set()
 
     def clear_history(self) -> None:
         self._history.clear()
+        self._known_files.clear()
 
     def _filter_existing(self, hits: list[QueryHit]) -> list[QueryHit]:
         """Drop hits whose backing file no longer exists under the watch folder.
@@ -174,6 +226,7 @@ class ChatService:
             return
 
         recency = parse_recency_intent(question)
+        discovery = _is_discovery_question(question) if recency is None else False
         window = None if recency else parse_time_intent(question)
 
         if recency is not None:
@@ -243,6 +296,13 @@ class ChatService:
         # weren't purged. Also opportunistically cleans those chunks up.
         hits = self._filter_existing(hits)
 
+        # Remember every real file we surfaced this turn so the sources line can
+        # be re-attributed to whatever the answer actually cites (see below) —
+        # even on a later turn that answers from history without re-retrieving.
+        for hit in hits:
+            if hit.file_name and hit.file_path:
+                self._known_files[hit.file_name] = hit.file_path
+
         if not hits:
             if recency is not None:
                 yield TokenChunk(text="I haven't indexed any files yet.")
@@ -252,6 +312,13 @@ class ChatService:
                 yield TokenChunk(
                     text=f"I couldn't find any files modified during {window.label}."
                 )
+                yield SourcesChunk(paths=())
+                return
+            if discovery:
+                # "Is there any file on X?" with nothing retrieved is a clean
+                # "no" — don't fall through to the LLM/history path, which is for
+                # content follow-ups, not existence questions.
+                yield TokenChunk(text="No — I couldn't find any files matching that.")
                 yield SourcesChunk(paths=())
                 return
             if not self._history:
@@ -282,6 +349,25 @@ class ChatService:
         # one") resolve against it.
         if recency is not None:
             answer = _format_recency_answer(hits)
+            yield TokenChunk(text=answer)
+            user_message = _build_user_message(question, hits, window, recency)
+            self._history.append({"role": "user", "content": user_message})
+            self._history.append({"role": "assistant", "content": answer})
+            max_messages = MAX_HISTORY_TURNS * 2
+            if len(self._history) > max_messages:
+                self._history = self._history[-max_messages:]
+            return
+
+        # A file-discovery question ("is there any file on X?") wants the LIST of
+        # relevant files, which retrieval has already determined. Format it in
+        # Python and skip the LLM — the same reasoning as recency. A small model
+        # handed this either names only one of several files it was given (the
+        # "answers only one" complaint) or invents a filename matching the topic
+        # word ("AI POC Idea.pptx" that doesn't exist). Listing the real hit
+        # filenames is complete and cannot confabulate. Still recorded in history
+        # so follow-ups ("tell me about the second one") resolve against it.
+        if discovery:
+            answer = _format_discovery_answer(hits)
             yield TokenChunk(text=answer)
             user_message = _build_user_message(question, hits, window, recency)
             self._history.append({"role": "user", "content": user_message})
@@ -334,8 +420,24 @@ class ChatService:
             yield TokenChunk(text=f"\n[error: {ex}]")
 
         if completed:
+            answer = "".join(answer_parts)
+            # Re-attribute the sources line only when the answer is grounded in
+            # conversation *history* rather than this turn's retrieval. The tell
+            # is that the answer cites a known file the fresh retrieval did NOT
+            # surface — e.g. a "second half" follow-up the model answers from the
+            # attendance doc shown earlier, while this turn's retrieval dredged up
+            # unrelated junk (installers). In that case trust the citations and
+            # drop the junk. Otherwise leave the retrieved set untouched: a normal
+            # answer that names only one of several genuinely-relevant retrieved
+            # files must NOT lose the others from its sources just because the
+            # prose didn't mention them by name.
+            cited = _sources_from_answer(answer, self._known_files)
+            grounded_in_history = any(path not in seen_paths for path in cited)
+            if grounded_in_history:
+                yield SourcesChunk(paths=tuple(cited))
+
             self._history.append({"role": "user", "content": user_message})
-            self._history.append({"role": "assistant", "content": "".join(answer_parts)})
+            self._history.append({"role": "assistant", "content": answer})
             # Trim oldest turns so history stays bounded.
             max_messages = MAX_HISTORY_TURNS * 2
             if len(self._history) > max_messages:
@@ -360,6 +462,48 @@ def _format_recency_answer(hits: list[QueryHit]) -> str:
             modified = "unknown"
         lines.append(f"{i}. {hit.file_name} — {modified}")
     return "\n".join(lines)
+
+
+def _format_discovery_answer(hits: list[QueryHit]) -> str:
+    """Render a file-discovery answer: a complete, deduped list of the relevant
+    files' names. Built in Python (not the LLM) so every retrieved file is listed
+    and no filename can be invented. ``hits`` are assumed non-empty (the caller
+    handles the no-results case separately)."""
+    names: list[str] = []
+    for hit in hits:
+        if hit.file_name and hit.file_name not in names:
+            names.append(hit.file_name)
+    count = len(names)
+    noun = "file" if count == 1 else "files"
+    header = f"Yes — I found {count} {noun} related to your question:"
+    return "\n".join([header, *(f"- {name}" for name in names)])
+
+
+def _sources_from_answer(answer: str, known_files: dict[str, str]) -> list[str]:
+    """Paths of the known files whose name appears in ``answer``, in the order
+    the names first appear.
+
+    Lets the sources line reflect what the answer actually cites rather than
+    everything that was retrieved. ``known_files`` maps file_name -> file_path for
+    every real file surfaced so far this conversation, so a file re-referenced
+    from history (not re-retrieved this turn) still resolves to its path. Returns
+    an empty list when the answer names no known file — callers keep the
+    retrieved list in that case.
+    """
+    low = answer.lower()
+    found: list[tuple[int, str]] = []
+    for name, path in known_files.items():
+        if not name:
+            continue
+        idx = low.find(name.lower())
+        if idx != -1:
+            found.append((idx, path))
+    found.sort(key=lambda t: t[0])
+    ordered: list[str] = []
+    for _, path in found:
+        if path not in ordered:
+            ordered.append(path)
+    return ordered
 
 
 def _merge_unique(groups: list[list[QueryHit]], limit: int) -> list[QueryHit]:
@@ -398,14 +542,18 @@ def _build_user_message(
         )
     for hit in hits:
         modified = hit.modified_at.isoformat() if hit.modified_at else "unknown"
+        # Label files with a plain-English line rather than '--- File: … ---'
+        # markup: a small model tends to parrot heading-style delimiters verbatim
+        # into its answer. If this natural label does leak through, it still reads
+        # like a sentence instead of stray formatting.
         if hit.extraction_source == "filename_only":
             blocks.append(
-                f"--- File: {hit.file_name} "
-                f"(filename only — contents not indexed, modified: {modified}) ---"
+                f'File "{hit.file_name}" '
+                f"(filename only — contents not indexed; modified {modified})"
             )
         else:
             blocks.append(
-                f"--- File: {hit.file_name} (modified: {modified}) ---\n{hit.text}"
+                f'File "{hit.file_name}" (modified {modified}):\n{hit.text}'
             )
     blocks.append("")
     blocks.append(f"Question: {question}")

@@ -4,7 +4,11 @@ from typing import Any
 import pytest
 
 from ai_file_brain.config import AiFileBrainSettings
-from ai_file_brain.core.chat import ChatService, _filename_keywords
+from ai_file_brain.core.chat import (
+    ChatService,
+    _filename_keywords,
+    _is_discovery_question,
+)
 from ai_file_brain.core.models import (
     QueryHit,
     SourcesChunk,
@@ -418,7 +422,7 @@ async def test_filename_only_hit_rendered_without_body_in_prompt():
     ]
     ollama = FakeOllama(["ok"])
     chat = ChatService(_settings(), FakeEmbedder(), FakeRepo(hits), ollama)
-    await chat.ask("do I have files on mcf core?")
+    await chat.ask("tell me about the mcf core installer")
 
     msgs = ollama.last_kwargs["messages"]
     user_msg = msgs[-1]["content"]
@@ -427,6 +431,200 @@ async def test_filename_only_hit_rendered_without_body_in_prompt():
     # System prompt should warn the model about filename-only entries.
     system_msg = msgs[0]["content"]
     assert "filename only" in system_msg.lower()
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_forbids_inventing_filenames():
+    """Regression: a content question about 'AI POC Idea' when only
+    'Meeting Notes.pptx' (which *mentions* the topic in its body) was retrieved
+    made the model confabulate a non-existent 'AI_POC_Idea.docx'. The system
+    prompt (on the LLM content path) must explicitly forbid inventing a filename
+    from a topic seen inside a file's contents. (Pure file-discovery questions
+    skip the LLM entirely and so cannot confabulate — covered separately.)"""
+    hits = [
+        QueryHit(
+            chunk_id="1",
+            file_path="/dl/Meeting Notes.pptx",
+            file_name="Meeting Notes.pptx",
+            chunk_index=0,
+            text="Agenda: discuss the AI POC Idea and next steps.",
+            distance=0.2,
+            modified_at=datetime(2026, 6, 8, tzinfo=UTC),
+        ),
+    ]
+    ollama = FakeOllama(["ok"])
+    chat = ChatService(_settings(), FakeEmbedder(), FakeRepo(hits), ollama)
+    await chat.ask("what does the meeting note say about the AI POC idea?")
+
+    system_msg = ollama.last_kwargs["messages"][0]["content"].lower()
+    # Must instruct the model not to fabricate filenames and that a topic inside
+    # a file's body is not evidence a file by that name exists.
+    assert "invent" in system_msg or "guess" in system_msg
+    assert "inside" in system_msg and "contents" in system_msg
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "is there any files on office timings?",
+        "Is there any files on AI POC Idea?",
+        "is there any files for project ideas?",
+        "are there any documents about budget?",
+        "is there a file on the overtime policy?",
+        "do I have any files about attendance?",
+        "which files mention the second half?",
+        "what files do I have on payroll?",
+        "list all files about onboarding",
+        "show me documents on leave policy",
+    ],
+)
+def test_is_discovery_question_true_for_file_listing_asks(question):
+    assert _is_discovery_question(question) is True
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        # Content questions — want a fact from inside a file, not a file list.
+        "can you tell me the starting time of second half of office?",
+        "what is the start time for the second half?",
+        "when does the office open?",
+        "summarise the overtime policy",
+        "what was I working on yesterday?",
+        "tell me more about it",
+    ],
+)
+def test_is_discovery_question_false_for_content_asks(question):
+    assert _is_discovery_question(question) is False
+
+
+@pytest.mark.asyncio
+async def test_discovery_question_lists_all_files_and_skips_llm():
+    """The reported bug: 'is there any files on office timings?' must list EVERY
+    relevant file (both Overtime Policy.docx and Attendence.docx), not just one.
+    Discovery answers are formatted from the hits in Python, so the LLM — which
+    dropped a file / invented one — is not involved."""
+    overtime = QueryHit(
+        "o", "/dl/Overtime Policy.docx", "Overtime Policy.docx", 0,
+        "total office hours", 0.30, datetime(2026, 5, 18, tzinfo=UTC),
+    )
+    attendance = QueryHit(
+        "a", "/dl/Attendence.docx", "Attendence.docx", 0,
+        "office timing rules", 0.34, datetime(2026, 5, 18, tzinfo=UTC),
+    )
+    repo = FakeRepo(hits=[overtime, attendance])
+    ollama = FakeOllama(["should-not-be-used"])
+    chat = ChatService(_settings(), FakeEmbedder(), repo, ollama)
+
+    result = await chat.ask("is there any files on office timings?")
+
+    assert ollama.last_kwargs is None  # LLM not invoked
+    assert "Overtime Policy.docx" in result.answer
+    assert "Attendence.docx" in result.answer
+    assert result.sources == ("/dl/Overtime Policy.docx", "/dl/Attendence.docx")
+
+
+@pytest.mark.asyncio
+async def test_discovery_question_cannot_confabulate_filename():
+    """'Is there any files on AI POC Idea?' with only Meeting Notes.pptx retrieved
+    must name the real file, never a topic-derived 'AI POC Idea.pptx'. Because the
+    answer is built from the hit filenames, confabulation is impossible."""
+    hits = [
+        QueryHit(
+            "1", "/dl/Meeting Notes.pptx", "Meeting Notes.pptx", 0,
+            "Agenda: AI POC Idea discussion", 0.3, datetime(2026, 6, 8, tzinfo=UTC),
+        ),
+    ]
+    ollama = FakeOllama(["should-not-be-used"])
+    chat = ChatService(_settings(), FakeEmbedder(), FakeRepo(hits), ollama)
+
+    result = await chat.ask("is there any files on AI POC Idea?")
+
+    assert ollama.last_kwargs is None
+    assert "Meeting Notes.pptx" in result.answer
+    assert "AI POC Idea.pptx" not in result.answer
+    assert result.sources == ("/dl/Meeting Notes.pptx",)
+
+
+@pytest.mark.asyncio
+async def test_discovery_question_no_hits_says_no():
+    repo = FakeRepo(hits=[])
+    ollama = FakeOllama(["should-not-be-used"])
+    chat = ChatService(_settings(), FakeEmbedder(), repo, ollama)
+    result = await chat.ask("is there any files on quantum widgets?")
+    assert ollama.last_kwargs is None
+    assert "couldn't find" in result.answer.lower()
+    assert result.sources == ()
+
+
+@pytest.mark.asyncio
+async def test_sources_reattributed_to_cited_file_not_junk_retrieval():
+    """Regression: on a follow-up answered from history, the fresh retrieval was
+    unrelated filename-only junk (installers/DLLs surfaced for 'second half'),
+    yet those junk files were shown as Sources while the answer actually cited a
+    file from an earlier turn. The sources line must follow what the answer
+    cites, not the junk retrieval."""
+    # Turn 1: a real content file is surfaced (and so remembered for the convo).
+    attendance = QueryHit(
+        "a", "/dl/Attendence.docx", "Attendence.docx", 0,
+        "2nd half: considered late after 2:00 pm", 0.2,
+        datetime(2026, 5, 18, tzinfo=UTC),
+    )
+    repo = FakeRepo(hits=[attendance])
+    ollama = FakeOllama(["Office attendance info."])
+    chat = ChatService(_settings(), FakeEmbedder(), repo, ollama)
+    await chat.ask("office timings?")
+
+    # Turn 2: retrieval brings back only unrelated filename-only junk, but the
+    # model answers from history, naming Attendence.docx.
+    junk = QueryHit(
+        "j", "/dl/Git-2.54.0-64-bit.exe", "Git-2.54.0-64-bit.exe", 0,
+        "Git-2.54.0-64-bit.exe", 0.7, datetime(2026, 5, 1, tzinfo=UTC),
+        extraction_source="filename_only",
+    )
+    repo.hits = [junk]
+    ollama.tokens = [
+        'According to "Attendence.docx", the 2nd half is late after 2:00 pm.'
+    ]
+    result = await chat.ask("what about the second half?")
+
+    assert result.sources == ("/dl/Attendence.docx",)
+    assert "/dl/Git-2.54.0-64-bit.exe" not in result.sources
+
+
+@pytest.mark.asyncio
+async def test_sources_keep_all_retrieved_when_answer_names_subset():
+    """Regression: 'office timings' retrieves both Overtime Policy.docx and
+    Attendence.docx (both genuinely relevant content matches). The model's prose
+    happens to name only one of them. BOTH must stay in Sources — a retrieved,
+    relevant file must not be dropped just because the answer didn't mention it
+    by name."""
+    overtime = QueryHit(
+        "o", "/dl/Overtime Policy.docx", "Overtime Policy.docx", 0,
+        "total office hours and overtime", 0.30, datetime(2026, 5, 18, tzinfo=UTC),
+    )
+    attendance = QueryHit(
+        "a", "/dl/Attendence.docx", "Attendence.docx", 0,
+        "attendance and office timing rules", 0.34, datetime(2026, 5, 18, tzinfo=UTC),
+    )
+    repo = FakeRepo(hits=[overtime, attendance])
+    ollama = FakeOllama(['The file "Overtime Policy.docx" mentions office timings.'])
+    chat = ChatService(_settings(), FakeEmbedder(), repo, ollama)
+    # Phrased as a content question so it takes the LLM path (where the answer
+    # names only one file) — that's the re-attribution case under test.
+    result = await chat.ask("what are the office timings?")
+    assert result.sources == ("/dl/Overtime Policy.docx", "/dl/Attendence.docx")
+
+
+@pytest.mark.asyncio
+async def test_sources_unchanged_when_answer_names_no_file():
+    """When the answer doesn't name any known file, keep the retrieved sources
+    as-is (no spurious second SourcesChunk that would blank the line)."""
+    hits = [QueryHit("1", "/a.txt", "a.txt", 0, "stuff", 0.1, None)]
+    ollama = FakeOllama(["Here is a generic answer with no filename."])
+    chat = ChatService(_settings(), FakeEmbedder(), FakeRepo(hits), ollama)
+    result = await chat.ask("what?")
+    assert result.sources == ("/a.txt",)
 
 
 @pytest.mark.asyncio
@@ -454,7 +652,7 @@ async def test_conceptual_query_surfaces_filename_only_semantic_match():
     ollama = FakeOllama(["ok"])
     chat = ChatService(_settings(), FakeEmbedder(), repo, ollama)
 
-    result = await chat.ask("is there any file of office timings?")
+    result = await chat.ask("what are the office timings?")
 
     assert "/dl/attendance.xlsx" in result.sources
     # And it reaches the LLM prompt as a filename-only entry (no invented body).
@@ -493,7 +691,7 @@ async def test_empty_retrieval_without_history_says_not_found():
     ollama = FakeOllama(["should not be used"])
     chat = ChatService(_settings(), FakeEmbedder(), repo, ollama)
 
-    result = await chat.ask("is there any file on quantum widgets?")
+    result = await chat.ask("what do my files say about quantum widgets?")
 
     assert ollama.last_kwargs is None, "LLM must NOT be called when nothing to ground on"
     assert "couldn't find" in result.answer
