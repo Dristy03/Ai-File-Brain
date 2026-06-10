@@ -23,7 +23,7 @@ A local-first desktop app that watches a folder, indexes your files into a local
 
 **Retrieval & chat**
 
-- Local embeddings via Ollama (`nomic-embed-text`)
+- Local embeddings via Ollama (`bge-m3`, 1024-dim)
 - Persistent ChromaDB vector store (cosine space, in-process, no server)
 - Local LLM chat via Ollama (`llama3.2`), grounded on top-k retrieved chunks with file-name and modified-time citations
 - **Temporal queries** — natural-language time scoping translated to a Chroma `modified_at` range filter:
@@ -50,7 +50,7 @@ A local-first desktop app that watches a folder, indexes your files into a local
 - Python 3.12
 - PySide6 (Qt 6) + qasync for the desktop UI and async event loop
 - ChromaDB `PersistentClient` for the vector store
-- Ollama for embeddings (`nomic-embed-text`) and chat (`llama3.2`)
+- Ollama for embeddings (`bge-m3`) and chat (`llama3.2`)
 - `watchdog` for file events
 - `pypdf` + `python-docx` + `python-pptx` + `openpyxl` for modern formats; `xlrd` + `olefile` for legacy `.xls` / `.ppt` / `.doc`
 - `rapidocr-onnxruntime` + `PyMuPDF` + `Pillow` for scanned-PDF OCR (no external binaries)
@@ -61,7 +61,7 @@ A local-first desktop app that watches a folder, indexes your files into a local
 1. **Python 3.12** on PATH.
 2. **[Ollama](https://ollama.com)** running locally. Pull the models once:
    ```
-   ollama pull nomic-embed-text
+   ollama pull bge-m3
    ollama pull llama3.2
    ```
 3. **[uv](https://docs.astral.sh/uv/)** (recommended) or pip.

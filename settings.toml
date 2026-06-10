@@ -6,7 +6,7 @@
 watch_folder = "~/Downloads"
 ollama_url = "http://127.0.0.1:11434"
 chroma_path = "./chroma-data"
-embedding_model = "nomic-embed-text"
+embedding_model = "bge-m3"
 chat_model = "llama3.2"
 chunk_size = 2000
 chunk_overlap = 400
